@@ -183,6 +183,8 @@ AETHER_RPC_HTTP_URL_3=https://backup-rpc-3.example
 
 When the active endpoint fails, the RPC client tries the next configured endpoint. After a backup endpoint succeeds, it becomes the preferred endpoint for subsequent calls.
 
+For dense block ranges, some RPC providers reject `eth_getLogs` requests when the response would exceed their result limit. Aether Indexer detects those limit errors, splits the requested block range into smaller ranges, and advances the stored cursor after each successful sub-range.
+
 ```mermaid
 flowchart TD
     START["RPC request"] --> P1["Try primary endpoint"]
@@ -234,7 +236,7 @@ The Docker Compose defaults are suitable for Arbitrum One testing. Values can be
 | `AETHER_CHAIN_ID` | No | `42161` in Docker | EVM chain ID |
 | `AETHER_START_BLOCK` | No | `0` | First block to index |
 | `AETHER_CONFIRMATIONS` | No | `20` in Docker | Blocks kept behind the head before indexing |
-| `AETHER_CHUNK_SIZE` | No | `1000` | Block range size per `eth_getLogs` request |
+| `AETHER_CHUNK_SIZE` | No | `1000` | Initial block range size per `eth_getLogs` request; dense ranges are split automatically when the RPC provider returns a result-limit error |
 | `AETHER_POLL_INTERVAL_MS` | No | `3000` in Docker | Delay between polling attempts |
 | `AETHER_RPC_TIMEOUT_MS` | No | `30000` in Docker | RPC request timeout |
 | `AETHER_API_BIND` | No | `0.0.0.0:8090` | API bind address |

@@ -269,6 +269,48 @@ pub enum RpcError {
     TokenUriDecode(String),
 }
 
+impl RpcError {
+    pub fn is_log_result_limit_exceeded(&self) -> bool {
+        match self {
+            Self::Rpc(code, message) => *code == -32602 && is_log_result_limit_message(message),
+            Self::AllEndpointsFailed(message) => is_log_result_limit_message(message),
+            _ => false,
+        }
+    }
+
+    pub fn suggested_log_retry_range(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Rpc(_, message) | Self::AllEndpointsFailed(message) => {
+                parse_log_retry_range(message)
+            }
+            _ => None,
+        }
+    }
+}
+
+fn is_log_result_limit_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("query exceeds max results")
+        || normalized.contains("response size should not exceed")
+        || normalized.contains("too many results")
+        || normalized.contains("more than")
+            && normalized.contains("results")
+            && normalized.contains("eth_getlogs")
+}
+
+fn parse_log_retry_range(message: &str) -> Option<(u64, u64)> {
+    let retry_pos = message.to_ascii_lowercase().find("retry with the range")?;
+    let tail = &message[retry_pos..];
+    let mut numbers = tail
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok());
+
+    let from = numbers.next()?;
+    let to = numbers.next()?;
+    if from <= to { Some((from, to)) } else { None }
+}
+
 fn to_hex_block(value: u64) -> String {
     format!("0x{value:x}")
 }
@@ -371,7 +413,7 @@ fn word_to_usize(word: &[u8]) -> Result<usize, RpcError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decimal_to_u256_word, decode_abi_string};
+    use super::{RpcError, decimal_to_u256_word, decode_abi_string};
 
     #[test]
     fn encodes_decimal_token_id() {
@@ -389,6 +431,20 @@ mod tests {
         assert_eq!(
             decode_abi_string(value).unwrap(),
             "ipfs://collection/1.json"
+        );
+    }
+
+    #[test]
+    fn detects_log_result_limit_errors() {
+        let err = RpcError::AllEndpointsFailed(
+            "https://rpc.testnet.arc.network: rpc error -32602: query exceeds max results 20000, retry with the range 6326001-6326937"
+                .to_owned(),
+        );
+
+        assert!(err.is_log_result_limit_exceeded());
+        assert_eq!(
+            err.suggested_log_retry_range(),
+            Some((6_326_001, 6_326_937))
         );
     }
 }

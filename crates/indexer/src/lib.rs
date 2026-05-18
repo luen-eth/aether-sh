@@ -1,6 +1,7 @@
 use common::ChainConfig;
 use parser::{ParseError, parse_transfer_logs};
 use rpc::{RpcClient, RpcError};
+use std::collections::VecDeque;
 use storage::{NftTokenKey, StorageError, Store};
 use thiserror::Error;
 use tokio::sync::watch;
@@ -49,6 +50,13 @@ impl IndexerService {
                 }
                 Err(err) => {
                     warn!(error = %err, "indexer tick failed, retrying");
+                    match self.store.last_scanned_block().await {
+                        Ok(last_db_block) => cursor = cursor.max(last_db_block),
+                        Err(store_err) => warn!(
+                            error = %store_err,
+                            "failed to reload indexer cursor after tick error"
+                        ),
+                    }
                     tokio::select! {
                         _ = tokio::time::sleep(self.config.poll_interval()) => {}
                         _ = shutdown.changed() => {}
@@ -72,6 +80,49 @@ impl IndexerService {
             from_block.saturating_add(self.config.chunk_size.saturating_sub(1)),
         );
 
+        let indexed_to = self
+            .index_block_range_adaptive(from_block, to_block)
+            .await?;
+        Ok(Some(indexed_to))
+    }
+
+    async fn index_block_range_adaptive(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<u64, IndexerError> {
+        let mut ranges = VecDeque::from([(from_block, to_block)]);
+        let mut indexed_to = from_block.saturating_sub(1);
+
+        while let Some((range_from, range_to)) = ranges.pop_front() {
+            match self.index_block_range(range_from, range_to).await {
+                Ok(()) => indexed_to = range_to,
+                Err(IndexerError::Rpc(err))
+                    if err.is_log_result_limit_exceeded() && range_from < range_to =>
+                {
+                    let split_to = suggested_split_to(&err, range_from, range_to)
+                        .unwrap_or_else(|| range_from + (range_to - range_from) / 2);
+
+                    warn!(
+                        from_block = range_from,
+                        to_block = range_to,
+                        first_to_block = split_to,
+                        second_from_block = split_to.saturating_add(1),
+                        error = %err,
+                        "rpc log result limit exceeded, splitting block range"
+                    );
+
+                    ranges.push_front((split_to.saturating_add(1), range_to));
+                    ranges.push_front((range_from, split_to));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(indexed_to)
+    }
+
+    async fn index_block_range(&self, from_block: u64, to_block: u64) -> Result<(), IndexerError> {
         let logs = self.rpc.get_transfer_logs(from_block, to_block).await?;
         let transfers = parse_transfer_logs(self.config.chain_id, &logs)?;
         let summary = self.store.ingest_transfers(&transfers).await?;
@@ -88,7 +139,7 @@ impl IndexerService {
             detected_nft_tokens = summary.nft_tokens_to_fetch.len(),
             "indexed block range"
         );
-        Ok(Some(to_block))
+        Ok(())
     }
 
     async fn fetch_detected_nft_token_uris(&self, tokens: &[NftTokenKey]) {
@@ -156,6 +207,15 @@ impl IndexerService {
     }
 }
 
+fn suggested_split_to(err: &RpcError, range_from: u64, range_to: u64) -> Option<u64> {
+    let (_, suggested_to) = err.suggested_log_retry_range()?;
+    if (range_from..range_to).contains(&suggested_to) {
+        Some(suggested_to)
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum IndexerError {
     #[error("rpc error: {0}")]
@@ -164,4 +224,33 @@ pub enum IndexerError {
     Parse(#[from] ParseError),
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::suggested_split_to;
+    use rpc::RpcError;
+
+    #[test]
+    fn uses_rpc_suggested_log_range_when_inside_requested_range() {
+        let err = RpcError::AllEndpointsFailed(
+            "rpc error -32602: query exceeds max results 20000, retry with the range 6326001-6326937"
+                .to_owned(),
+        );
+
+        assert_eq!(
+            suggested_split_to(&err, 6_326_001, 6_327_000),
+            Some(6_326_937)
+        );
+    }
+
+    #[test]
+    fn ignores_rpc_suggested_log_range_when_outside_requested_range() {
+        let err = RpcError::AllEndpointsFailed(
+            "rpc error -32602: query exceeds max results 20000, retry with the range 6326001-6326937"
+                .to_owned(),
+        );
+
+        assert_eq!(suggested_split_to(&err, 6_326_938, 6_327_000), None);
+    }
 }
