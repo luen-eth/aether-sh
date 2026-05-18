@@ -4,9 +4,12 @@ use common::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
 };
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -26,6 +29,7 @@ pub struct RpcClient {
     http_urls: Arc<Vec<String>>,
     http: Client,
     preferred_index: Arc<AtomicUsize>,
+    rate_limit_backoff: Duration,
 }
 
 impl RpcClient {
@@ -46,6 +50,7 @@ impl RpcClient {
             http_urls: Arc::new(config.rpc_http_urls.clone()),
             http,
             preferred_index: Arc::new(AtomicUsize::new(0)),
+            rate_limit_backoff: Duration::from_millis(config.rate_limit_backoff_ms.max(250)),
         })
     }
 
@@ -117,47 +122,77 @@ impl RpcClient {
             return Err(RpcError::NoEndpoints);
         }
 
-        let start = self.preferred_index.load(Ordering::Relaxed) % total;
-        let mut last_error_message = String::new();
+        let mut rate_limit_retries = 0u64;
 
-        for attempt in 0..total {
-            let index = (start + attempt) % total;
-            let endpoint = &self.http_urls[index];
-            match self.rpc_call_single(endpoint, &payload).await {
-                Ok(value) => {
-                    if attempt > 0 {
-                        warn!(
-                            method,
-                            endpoint,
-                            failed_endpoints = attempt,
-                            "rpc failover switched endpoint"
-                        );
+        loop {
+            let start = self.preferred_index.load(Ordering::Relaxed) % total;
+            let mut last_error_message = String::new();
+            let mut rate_limited_endpoints = 0usize;
+            let mut rate_limit_delay = self.rate_limit_backoff;
+
+            for attempt in 0..total {
+                let index = (start + attempt) % total;
+                let endpoint = &self.http_urls[index];
+                match self.rpc_call_single(endpoint, &payload).await {
+                    Ok(value) => {
+                        if attempt > 0 {
+                            warn!(
+                                method,
+                                endpoint,
+                                failed_endpoints = attempt,
+                                "rpc failover switched endpoint"
+                            );
+                        }
+                        self.preferred_index.store(index, Ordering::Relaxed);
+                        return Ok(value);
                     }
-                    self.preferred_index.store(index, Ordering::Relaxed);
-                    return Ok(value);
-                }
-                Err(err) => {
-                    last_error_message = format!("{endpoint}: {err}");
-                    if method == "eth_getLogs" && err.is_log_result_limit_exceeded() {
-                        debug!(
-                            method,
-                            endpoint,
-                            error = %err,
-                            "rpc log result limit reached"
-                        );
-                    } else {
-                        warn!(
-                            method,
-                            endpoint,
-                            error = %err,
-                            "rpc endpoint failed"
-                        );
+                    Err(err) => {
+                        last_error_message = format!("{endpoint}: {err}");
+                        if err.is_rate_limited() {
+                            rate_limited_endpoints += 1;
+                            let delay = err.suggested_rate_limit_delay(self.rate_limit_backoff);
+                            if delay > rate_limit_delay {
+                                rate_limit_delay = delay;
+                            }
+                            debug!(
+                                method,
+                                endpoint,
+                                error = %err,
+                                "rpc endpoint rate limited"
+                            );
+                        } else if method == "eth_getLogs" && err.is_log_result_limit_exceeded() {
+                            debug!(
+                                method,
+                                endpoint,
+                                error = %err,
+                                "rpc log result limit reached"
+                            );
+                        } else {
+                            warn!(
+                                method,
+                                endpoint,
+                                error = %err,
+                                "rpc endpoint failed"
+                            );
+                        }
                     }
                 }
             }
-        }
 
-        Err(RpcError::AllEndpointsFailed(last_error_message))
+            if rate_limited_endpoints == total {
+                rate_limit_retries += 1;
+                warn!(
+                    method,
+                    delay_ms = rate_limit_delay.as_millis(),
+                    retry = rate_limit_retries,
+                    "all rpc endpoints rate limited, waiting before retry"
+                );
+                tokio::time::sleep(rate_limit_delay).await;
+                continue;
+            }
+
+            return Err(RpcError::AllEndpointsFailed(last_error_message));
+        }
     }
 
     async fn rpc_call_single<T>(
@@ -279,6 +314,32 @@ pub enum RpcError {
 }
 
 impl RpcError {
+    pub fn is_rate_limited(&self) -> bool {
+        match self {
+            Self::RpcStatus(429, _) => true,
+            Self::Rpc(code, message) => {
+                matches!(*code, -32007 | -32008) || is_rate_limit_message(message)
+            }
+            Self::AllEndpointsFailed(message) => is_rate_limit_message(message),
+            _ => false,
+        }
+    }
+
+    pub fn suggested_rate_limit_delay(&self, fallback: Duration) -> Duration {
+        let Some(message) = self.message_for_delay_hint() else {
+            return fallback;
+        };
+
+        let normalized = message.to_ascii_lowercase();
+        if normalized.contains("/minute") || normalized.contains("per minute") {
+            Duration::from_secs(60)
+        } else if normalized.contains("/second") || normalized.contains("per second") {
+            Duration::from_secs(1)
+        } else {
+            fallback
+        }
+    }
+
     pub fn is_log_result_limit_exceeded(&self) -> bool {
         match self {
             Self::Rpc(code, message) => *code == -32602 && is_log_result_limit_message(message),
@@ -295,6 +356,20 @@ impl RpcError {
             _ => None,
         }
     }
+
+    fn message_for_delay_hint(&self) -> Option<&str> {
+        match self {
+            Self::RpcStatus(_, message)
+            | Self::Rpc(_, message)
+            | Self::AllEndpointsFailed(message) => Some(message),
+            _ => None,
+        }
+    }
+}
+
+fn is_rate_limit_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("rate limit") || normalized.contains("request limit reached")
 }
 
 fn is_log_result_limit_message(message: &str) -> bool {
@@ -423,6 +498,7 @@ fn word_to_usize(word: &[u8]) -> Result<usize, RpcError> {
 #[cfg(test)]
 mod tests {
     use super::{RpcError, decimal_to_u256_word, decode_abi_string};
+    use std::time::Duration;
 
     #[test]
     fn encodes_decimal_token_id() {
@@ -454,6 +530,33 @@ mod tests {
         assert_eq!(
             err.suggested_log_retry_range(),
             Some((6_326_001, 6_326_937))
+        );
+    }
+
+    #[test]
+    fn detects_http_rate_limit_errors() {
+        let err = RpcError::RpcStatus(
+            429,
+            r#"{"code":-32007,"message":"100/second request limit reached"}"#.to_owned(),
+        );
+
+        assert!(err.is_rate_limited());
+        assert_eq!(
+            err.suggested_rate_limit_delay(Duration::from_millis(250)),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn uses_minute_delay_for_minute_rate_limits() {
+        let err = RpcError::RpcStatus(
+            429,
+            r#"{"code":-32008,"message":"3000/minute request limit reached"}"#.to_owned(),
+        );
+
+        assert_eq!(
+            err.suggested_rate_limit_delay(Duration::from_secs(1)),
+            Duration::from_secs(60)
         );
     }
 }

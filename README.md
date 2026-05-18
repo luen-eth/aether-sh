@@ -243,6 +243,7 @@ The Docker Compose defaults are suitable for Arbitrum One testing. Values can be
 | `AETHER_CHUNK_SIZE` | No | `1000` | Initial block range size per `eth_getLogs` request; dense ranges are split automatically when the RPC provider returns a result-limit error |
 | `AETHER_POLL_INTERVAL_MS` | No | `3000` in Docker | Delay between polling attempts |
 | `AETHER_RPC_TIMEOUT_MS` | No | `30000` in Docker | RPC request timeout |
+| `AETHER_RPC_RATE_LIMIT_BACKOFF_MS` | No | `1000` in Docker | Fallback delay before retrying when every configured RPC endpoint is rate limited; provider messages such as `/second` and `/minute` use 1 second and 60 second waits |
 | `AETHER_API_BIND` | No | `0.0.0.0:8090` | API bind address |
 
 ## API

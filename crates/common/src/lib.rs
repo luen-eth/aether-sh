@@ -80,6 +80,7 @@ impl AppConfig {
             chunk_size: env_parse("AETHER_CHUNK_SIZE", 1_000)?,
             poll_interval_ms: env_parse("AETHER_POLL_INTERVAL_MS", 4_000)?,
             request_timeout_ms: env_parse("AETHER_RPC_TIMEOUT_MS", 20_000)?,
+            rate_limit_backoff_ms: env_parse("AETHER_RPC_RATE_LIMIT_BACKOFF_MS", 1_000)?,
         };
 
         let database = DatabaseConfig {
@@ -110,6 +111,7 @@ pub struct ChainConfig {
     pub chunk_size: u64,
     pub poll_interval_ms: u64,
     pub request_timeout_ms: u64,
+    pub rate_limit_backoff_ms: u64,
 }
 
 impl ChainConfig {
