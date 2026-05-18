@@ -202,6 +202,8 @@ flowchart TD
 
 By default, Docker Compose starts a local PostgreSQL service and the application connects to it automatically.
 
+On startup, Aether Indexer runs its schema migration automatically. If the target database in `AETHER_DATABASE_URL` does not exist, the application first tries to connect to the `postgres` maintenance database and create the missing database before running migrations. This helps Dokploy and other persistent-volume deployments recover when a PostgreSQL data directory already exists but the expected application database is missing.
+
 To use an external PostgreSQL server while keeping the default Compose file, set `AETHER_DATABASE_URL` in `.env`:
 
 ```env
@@ -222,6 +224,8 @@ docker compose -f docker-compose.external-postgres.yml up -d --build
 ```
 
 This mode requires `AETHER_DATABASE_URL` in `.env`.
+
+For external PostgreSQL servers, the configured user must either have permission to create the target database or the database must be created before the service starts.
 
 ## Configuration
 

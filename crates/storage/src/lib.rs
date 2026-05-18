@@ -5,6 +5,8 @@ use common::{
 use sqlx::{FromRow, PgPool, QueryBuilder, Row, postgres::PgPoolOptions};
 use std::collections::HashSet;
 use thiserror::Error;
+use tracing::info;
+use url::Url;
 
 const MIGRATION_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS sync_state (
@@ -145,11 +147,15 @@ pub struct NftRefreshComplete {
 
 impl Store {
     pub async fn connect(config: &DatabaseConfig) -> Result<Self, StorageError> {
-        let pool = PgPoolOptions::new()
-            .max_connections(config.max_connections)
-            .connect(&config.url)
-            .await
-            .map_err(StorageError::Connect)?;
+        let pool = match connect_pool(config).await {
+            Ok(pool) => pool,
+            Err(err) if is_missing_database_error(&err) => {
+                create_database(&config.url).await?;
+                connect_pool(config).await.map_err(StorageError::Connect)?
+            }
+            Err(err) => return Err(StorageError::Connect(err)),
+        };
+
         let store = Self { pool };
         store.migrate().await?;
         Ok(store)
@@ -1249,10 +1255,87 @@ impl Store {
     }
 }
 
+async fn connect_pool(config: &DatabaseConfig) -> Result<PgPool, sqlx::Error> {
+    PgPoolOptions::new()
+        .max_connections(config.max_connections)
+        .connect(&config.url)
+        .await
+}
+
+async fn create_database(database_url: &str) -> Result<(), StorageError> {
+    let database_name = database_name_from_url(database_url)?;
+    let admin_url = maintenance_database_url(database_url)?;
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .map_err(StorageError::AdminConnect)?;
+
+    let statement = format!("CREATE DATABASE {}", quote_identifier(&database_name));
+    match sqlx::query(&statement).execute(&admin_pool).await {
+        Ok(_) => {
+            info!(database = %database_name, "created missing postgres database");
+            Ok(())
+        }
+        Err(err) if is_duplicate_database_error(&err) => Ok(()),
+        Err(err) => Err(StorageError::CreateDatabase(err)),
+    }
+}
+
+fn maintenance_database_url(database_url: &str) -> Result<String, StorageError> {
+    let mut parsed = Url::parse(database_url).map_err(StorageError::DatabaseUrl)?;
+    parsed.set_path("/postgres");
+    Ok(parsed.to_string())
+}
+
+fn database_name_from_url(database_url: &str) -> Result<String, StorageError> {
+    let parsed = Url::parse(database_url).map_err(StorageError::DatabaseUrl)?;
+    let database_name = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .unwrap_or_default()
+        .trim();
+
+    if database_name.is_empty() || database_name.contains('\0') {
+        return Err(StorageError::InvalidDatabaseName(database_name.to_owned()));
+    }
+
+    Ok(database_name.to_owned())
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn is_missing_database_error(err: &sqlx::Error) -> bool {
+    database_error_code(err).as_deref() == Some("3D000")
+}
+
+fn is_duplicate_database_error(err: &sqlx::Error) -> bool {
+    database_error_code(err).as_deref() == Some("42P04")
+}
+
+fn database_error_code(err: &sqlx::Error) -> Option<String> {
+    match err {
+        sqlx::Error::Database(database_error) => {
+            database_error.code().map(|code| code.into_owned())
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("database connect failed: {0}")]
     Connect(sqlx::Error),
+    #[error("database admin connect failed: {0}")]
+    AdminConnect(sqlx::Error),
+    #[error("database create failed: {0}")]
+    CreateDatabase(sqlx::Error),
+    #[error("invalid database url: {0}")]
+    DatabaseUrl(url::ParseError),
+    #[error("invalid database name: {0}")]
+    InvalidDatabaseName(String),
     #[error("database migration failed: {0}")]
     Migrate(sqlx::Error),
     #[error("database query failed: {0}")]
@@ -1416,7 +1499,10 @@ fn common_suffix_len(left: &str, right: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{decimal_to_erc1155_hex_id, infer_base_uri_update};
+    use super::{
+        database_name_from_url, decimal_to_erc1155_hex_id, infer_base_uri_update,
+        maintenance_database_url, quote_identifier,
+    };
 
     #[test]
     fn infers_base_uri_from_token_id_suffix() {
@@ -1444,5 +1530,30 @@ mod tests {
             decimal_to_erc1155_hex_id("15"),
             "000000000000000000000000000000000000000000000000000000000000000f"
         );
+    }
+
+    #[test]
+    fn builds_maintenance_database_url() {
+        assert_eq!(
+            maintenance_database_url(
+                "postgres://postgres:postgres@postgres:5432/aether_indexer?sslmode=disable"
+            )
+            .unwrap(),
+            "postgres://postgres:postgres@postgres:5432/postgres?sslmode=disable"
+        );
+    }
+
+    #[test]
+    fn extracts_database_name_from_url() {
+        assert_eq!(
+            database_name_from_url("postgres://user:pass@localhost:5432/aether_indexer").unwrap(),
+            "aether_indexer"
+        );
+    }
+
+    #[test]
+    fn quotes_database_identifiers() {
+        assert_eq!(quote_identifier("aether_indexer"), "\"aether_indexer\"");
+        assert_eq!(quote_identifier("aether\"idx"), "\"aether\"\"idx\"");
     }
 }

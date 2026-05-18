@@ -12,7 +12,7 @@ services:
     volumes:
       - aether_postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d aether_indexer"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 5s
       timeout: 5s
       retries: 20

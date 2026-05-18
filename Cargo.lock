@@ -1855,6 +1855,7 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tracing",
+ "url",
 ]
 
 [[package]]
