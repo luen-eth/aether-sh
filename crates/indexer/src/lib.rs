@@ -103,12 +103,11 @@ impl IndexerService {
                     let split_to = suggested_split_to(&err, range_from, range_to)
                         .unwrap_or_else(|| range_from + (range_to - range_from) / 2);
 
-                    warn!(
+                    debug!(
                         from_block = range_from,
                         to_block = range_to,
                         first_to_block = split_to,
                         second_from_block = split_to.saturating_add(1),
-                        error = %err,
                         "rpc log result limit exceeded, splitting block range"
                     );
 

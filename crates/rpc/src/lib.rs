@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use thiserror::Error;
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub const ERC_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
@@ -138,12 +138,21 @@ impl RpcClient {
                 }
                 Err(err) => {
                     last_error_message = format!("{endpoint}: {err}");
-                    warn!(
-                        method,
-                        endpoint,
-                        error = %err,
-                        "rpc endpoint failed"
-                    );
+                    if method == "eth_getLogs" && err.is_log_result_limit_exceeded() {
+                        debug!(
+                            method,
+                            endpoint,
+                            error = %err,
+                            "rpc log result limit reached"
+                        );
+                    } else {
+                        warn!(
+                            method,
+                            endpoint,
+                            error = %err,
+                            "rpc endpoint failed"
+                        );
+                    }
                 }
             }
         }
