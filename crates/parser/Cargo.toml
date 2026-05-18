@@ -1,0 +1,11 @@
+[package]
+name = "parser"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+chrono.workspace = true
+common = { path = "../common" }
+hex.workspace = true
+rpc = { path = "../rpc" }
+thiserror.workspace = true

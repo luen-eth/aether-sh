@@ -1,0 +1,29 @@
+services:
+  aether-indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aether-indexer
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      AETHER_DATABASE_URL: ${AETHER_DATABASE_URL:?Set AETHER_DATABASE_URL in .env or in the shell}
+      AETHER_CHAIN_ID: "42161"
+      AETHER_START_BLOCK: "0"
+      AETHER_CONFIRMATIONS: "20"
+      AETHER_CHUNK_SIZE: "1000"
+      AETHER_POLL_INTERVAL_MS: "3000"
+      AETHER_RPC_TIMEOUT_MS: "30000"
+      AETHER_DB_MAX_CONNECTIONS: "20"
+      AETHER_API_BIND: 0.0.0.0:8090
+      AETHER_API_PAGE_SIZE_DEFAULT: "50"
+      AETHER_API_PAGE_SIZE_MAX: "200"
+      RUST_LOG: info
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20

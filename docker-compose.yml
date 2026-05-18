@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aether-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: aether_indexer
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - aether_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d aether_indexer"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  aether-indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aether-indexer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      AETHER_DATABASE_URL: ${AETHER_DATABASE_URL:-postgres://postgres:postgres@postgres:5432/aether_indexer}
+      AETHER_CHAIN_ID: "42161"
+      AETHER_START_BLOCK: "0"
+      AETHER_CONFIRMATIONS: "20"
+      AETHER_CHUNK_SIZE: "1000"
+      AETHER_POLL_INTERVAL_MS: "3000"
+      AETHER_RPC_TIMEOUT_MS: "30000"
+      AETHER_DB_MAX_CONNECTIONS: "20"
+      AETHER_API_BIND: 0.0.0.0:8090
+      AETHER_API_PAGE_SIZE_DEFAULT: "50"
+      AETHER_API_PAGE_SIZE_MAX: "200"
+      RUST_LOG: info
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8090/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+volumes:
+  aether_postgres_data:

@@ -1,0 +1,13 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+axum.workspace = true
+common = { path = "../common" }
+rpc = { path = "../rpc" }
+serde.workspace = true
+storage = { path = "../storage" }
+tower-http.workspace = true
+tracing.workspace = true

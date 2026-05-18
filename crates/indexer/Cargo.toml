@@ -1,0 +1,13 @@
+[package]
+name = "indexer"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+parser = { path = "../parser" }
+rpc = { path = "../rpc" }
+storage = { path = "../storage" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true

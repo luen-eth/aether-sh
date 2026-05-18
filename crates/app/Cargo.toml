@@ -1,0 +1,17 @@
+[package]
+name = "app"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+api = { path = "../api" }
+axum.workspace = true
+common = { path = "../common" }
+dotenvy.workspace = true
+indexer = { path = "../indexer" }
+rpc = { path = "../rpc" }
+storage = { path = "../storage" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
