@@ -1,33 +1,35 @@
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="aether-indexer banner" width="100%" />
+</p>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a>
+  |
+  <a href="#architecture">Architecture</a>
+  |
+  <a href="#api">API</a>
+  |
+  <a href="#nft-metadata-refresh">NFT Metadata</a>
+  |
+  <a href="#operations">Operations</a>
+</p>
+
 # aether-indexer
 
 `aether-indexer` is a Rust-based EVM indexer and HTTP API for token and NFT data.
 
-It scans chain logs from the configured start block, parses ERC-20, ERC-721, and ERC-1155 transfer events, stores normalized transfer history in PostgreSQL, and maintains query-ready balance and holder projections.
+It scans chain logs from a configured start block, indexes ERC-20, ERC-721, and ERC-1155 transfer events, stores normalized history in PostgreSQL, and maintains query-ready projections for balances, holders, ownership, and NFT token URIs.
 
-## Features
+## What It Indexes
 
-- EVM JSON-RPC indexing through `eth_blockNumber` and `eth_getLogs`
-- ERC-20, ERC-721, and ERC-1155 transfer parsing
-- Catch-up indexing from block `0` or any configured start block
-- Finality-aware polling with configurable confirmations
-- Up to three HTTP RPC endpoints with automatic failover
-- PostgreSQL-backed transfer, balance, ownership, and holder tables
-- NFT token URI persistence for detected ERC-721 and ERC-1155 tokens
-- Manual NFT metadata refresh with a five-minute per-token rate limit
-- Collection base URI propagation when a refreshed token URI changes
-- Docker Compose setup with bundled PostgreSQL
-- Optional external PostgreSQL connection through `.env`
-- Axum-based HTTP API
+| Data | Source | Stored output |
+| --- | --- | --- |
+| ERC-20 transfers | `Transfer(address,address,uint256)` | Transfers, token balances, holders |
+| ERC-721 transfers | `Transfer(address,address,uint256)` | Transfers, ownership, holders, token URI |
+| ERC-1155 transfers | `TransferSingle`, `TransferBatch` | Transfers, balances, holders, token URI |
+| NFT metadata refresh | `tokenURI(uint256)` or `uri(uint256)` | Updated token URI and optional collection base URI propagation |
 
-## Project Layout
-
-- `crates/common`: shared configuration, domain types, and helpers
-- `crates/rpc`: JSON-RPC client with endpoint failover
-- `crates/parser`: ERC transfer log parser
-- `crates/storage`: PostgreSQL schema, ingestion, and query layer
-- `crates/indexer`: catch-up and polling orchestration
-- `crates/api`: HTTP routes and response models
-- `crates/app`: application bootstrap and runtime wiring
+Native coin transfers, approvals, arbitrary contract calls, and unrelated logs are not stored.
 
 ## Quick Start
 
@@ -61,6 +63,114 @@ Expected response:
 {"status":"ok"}
 ```
 
+## Architecture
+
+```mermaid
+flowchart LR
+    RPC["EVM HTTP RPC<br/>primary + 2 backups"] --> INDEXER["Indexer service<br/>catch-up + polling"]
+    INDEXER --> PARSER["Log parser<br/>ERC-20 / ERC-721 / ERC-1155"]
+    PARSER --> STORAGE["PostgreSQL storage<br/>idempotent writes"]
+    STORAGE --> API["Axum HTTP API"]
+    API --> CLIENTS["Apps / explorers / dashboards"]
+
+    INDEXER --> URI["NFT URI fetcher<br/>tokenURI / uri"]
+    URI --> STORAGE
+    API --> REFRESH["Manual metadata refresh<br/>5 min per-token cooldown"]
+    REFRESH --> URI
+```
+
+### Runtime Flow
+
+```mermaid
+sequenceDiagram
+    participant I as Indexer
+    participant R as RPC
+    participant P as Parser
+    participant D as PostgreSQL
+    participant A as API
+
+    I->>D: Read sync_state.last_scanned_block
+    I->>R: eth_blockNumber
+    I->>I: Apply confirmation lag
+    I->>R: eth_getLogs for transfer topics
+    I->>P: Parse ERC-20 / ERC-721 / ERC-1155 events
+    P->>D: Insert transfers idempotently
+    D->>D: Update balances, ownership, holders
+    I->>R: tokenURI or uri for newly detected NFTs
+    I->>D: Store NFT token URI or fetch error
+    A->>D: Query balances, NFTs, holders, transfers
+```
+
+## Data Model
+
+```mermaid
+erDiagram
+    ASSETS ||--o{ TRANSFERS : "has"
+    ASSETS ||--o{ TOKEN_BALANCES : "projects"
+    ASSETS ||--o{ NFT_OWNERSHIPS : "owns"
+    ASSETS ||--o{ NFT_BALANCES : "balances"
+    ASSETS ||--o{ NFT_TOKENS : "metadata"
+    ASSETS ||--o| NFT_COLLECTION_METADATA : "base uri"
+
+    ASSETS {
+      text address PK
+      text standard
+      text name
+      text symbol
+      int decimals
+      bigint first_seen_block
+    }
+
+    TRANSFERS {
+      bigint chain_id
+      bigint block_number
+      text tx_hash
+      bigint log_index
+      text token_address FK
+      text standard
+      text from_address
+      text to_address
+      text token_id
+      numeric value_numeric
+    }
+
+    TOKEN_BALANCES {
+      text token_address FK
+      text holder_address
+      numeric balance_numeric
+    }
+
+    NFT_OWNERSHIPS {
+      text token_address FK
+      text token_id
+      text owner_address
+    }
+
+    NFT_BALANCES {
+      text token_address FK
+      text token_id
+      text holder_address
+      numeric balance_numeric
+    }
+
+    NFT_TOKENS {
+      text token_address FK
+      text token_id
+      text standard
+      text token_uri
+      text uri_status
+      timestamptz last_uri_fetch_at
+      timestamptz last_refresh_requested_at
+    }
+
+    NFT_COLLECTION_METADATA {
+      text token_address FK
+      text base_uri
+      text updated_from_token_id
+      timestamptz last_base_uri_update_at
+    }
+```
+
 ## RPC Failover
 
 The primary RPC endpoint is required. Two backup endpoints are optional.
@@ -71,7 +181,20 @@ AETHER_RPC_HTTP_URL_2=https://backup-rpc-2.example
 AETHER_RPC_HTTP_URL_3=https://backup-rpc-3.example
 ```
 
-When the active endpoint fails, the RPC client tries the next configured endpoint. After a backup endpoint succeeds, it becomes the preferred endpoint for the following calls.
+When the active endpoint fails, the RPC client tries the next configured endpoint. After a backup endpoint succeeds, it becomes the preferred endpoint for subsequent calls.
+
+```mermaid
+flowchart TD
+    START["RPC request"] --> P1["Try primary endpoint"]
+    P1 -->|success| DONE["Return response"]
+    P1 -->|failure| P2["Try backup endpoint 2"]
+    P2 -->|success| SWITCH["Mark backup 2 as preferred"]
+    P2 -->|failure| P3["Try backup endpoint 3"]
+    P3 -->|success| SWITCH3["Mark backup 3 as preferred"]
+    P3 -->|failure| FAIL["Return RPC error"]
+    SWITCH --> DONE
+    SWITCH3 --> DONE
+```
 
 ## PostgreSQL
 
@@ -90,7 +213,7 @@ If `AETHER_DATABASE_URL` is omitted, Docker Compose uses:
 postgres://postgres:postgres@postgres:5432/aether_indexer
 ```
 
-To run only the indexer container and skip the bundled PostgreSQL service, use the external PostgreSQL Compose file:
+To run only the indexer container and skip the bundled PostgreSQL service, use:
 
 ```bash
 docker compose -f docker-compose.external-postgres.yml up -d --build
@@ -100,7 +223,7 @@ This mode requires `AETHER_DATABASE_URL` in `.env`.
 
 ## Configuration
 
-The Docker Compose defaults are suitable for Arbitrum One testing. These values can be changed in `docker-compose.yml` or exported in the runtime environment.
+The Docker Compose defaults are suitable for Arbitrum One testing. Values can be changed in `docker-compose.yml` or exported in the runtime environment.
 
 | Variable | Required | Default | Description |
 | --- | --- | --- | --- |
@@ -118,64 +241,67 @@ The Docker Compose defaults are suitable for Arbitrum One testing. These values 
 
 ## API
 
-### Health
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /health` | Service health check |
+| `GET /v1/users/{address}/tokens` | ERC-20 balances for a user |
+| `GET /v1/users/{address}/nfts` | ERC-721 and ERC-1155 balances for a user |
+| `GET /v1/assets/search` | Search assets by address, symbol, or name |
+| `GET /v1/assets/{token_address}/holders` | Holder list for ERC-20, ERC-721, or ERC-1155 |
+| `GET /v1/transfers` | Recent transfers, optionally filtered by token or account |
+| `POST /v1/nfts/{token_address}/{token_id}/refresh-metadata` | Refresh one NFT token URI with cooldown |
 
-```http
-GET /health
-```
-
-### User token balances
+### Examples
 
 ```http
 GET /v1/users/{address}/tokens?limit=50&offset=0
 ```
 
-### User NFT balances
-
 ```http
 GET /v1/users/{address}/nfts?limit=50&offset=0
 ```
 
-The response includes `token_uri` when it has been fetched successfully.
-
-### Asset search
+The NFT response includes `token_uri` when it has been fetched successfully.
 
 ```http
 GET /v1/assets/search?q=usdc&limit=20
 ```
 
-### Asset holders
-
 ```http
 GET /v1/assets/{token_address}/holders?token_id={optional_token_id}&limit=50&offset=0
 ```
-
-For ERC-20 assets, holders are grouped by token balance.
-
-For ERC-721 assets, omitting `token_id` returns owners grouped by owned token count. Passing `token_id` returns the current owner of that token.
-
-For ERC-1155 assets, omitting `token_id` returns holders grouped by total balance across token IDs. Passing `token_id` returns holders for that specific token ID.
-
-### Transfers
 
 ```http
 GET /v1/transfers?token_address={optional_token}&account_address={optional_account}&limit=50&offset=0
 ```
 
-### Refresh NFT metadata
+## NFT Metadata Refresh
 
 ```http
 POST /v1/nfts/{token_address}/{token_id}/refresh-metadata
 ```
 
-This endpoint fetches the current token URI from the NFT contract:
+The endpoint fetches the current token URI from the NFT contract:
 
 - ERC-721 uses `tokenURI(uint256)`.
 - ERC-1155 uses `uri(uint256)`.
 
-The refresh endpoint is rate-limited per collection and token ID. A token can be refreshed once every five minutes. If the request is inside the cooldown window, the response status is `rate_limited` and includes `retry_after_seconds`.
+Refresh requests are limited to one request every five minutes for each `token_address + token_id` pair.
 
-When the refreshed token URI differs from the stored URI, `aether-indexer` tries to infer a base URI change. If the old and new URIs share the same token-specific suffix, the collection base URI is updated for all indexed tokens in that collection that still use the old base URI.
+```mermaid
+flowchart TD
+    REQ["Refresh request<br/>collection + token ID"] --> LIMIT{"Inside 5 minute cooldown?"}
+    LIMIT -->|yes| RATE["Return rate_limited<br/>retry_after_seconds"]
+    LIMIT -->|no| CALL["Call tokenURI or uri"]
+    CALL --> COMPARE{"URI changed?"}
+    COMPARE -->|no| SAME["Update fetch timestamp<br/>Return unchanged"]
+    COMPARE -->|yes| INFER["Infer old and new base URI"]
+    INFER --> CAN{"Base URI inferred?"}
+    CAN -->|no| SINGLE["Store only refreshed token URI"]
+    CAN -->|yes| COLLECTION["Rewrite indexed collection tokens<br/>that still use old base URI"]
+    SINGLE --> UPDATED["Return updated"]
+    COLLECTION --> UPDATED
+```
 
 Example response:
 
@@ -193,33 +319,7 @@ Example response:
 }
 ```
 
-## Indexing Flow
-
-1. Read the last indexed block from `sync_state`.
-2. Compute the next safe block range using `AETHER_CONFIRMATIONS`.
-3. Fetch transfer logs through `eth_getLogs`.
-4. Parse ERC-20, ERC-721, and ERC-1155 transfer events.
-5. Insert transfers idempotently.
-6. Update token balances, NFT ownership, NFT balances, and holder projections.
-7. Register newly detected NFT token IDs and fetch their token URI when available.
-8. Advance the cursor and continue polling.
-
-## NFT Metadata Behavior
-
-When an NFT token ID is first detected through an ERC-721 or ERC-1155 transfer, it is inserted into `nft_tokens` with a pending URI state. The indexer then calls the contract to fetch the token URI and stores the result.
-
-If the initial URI fetch fails, the token remains indexed and the fetch error is recorded. A later manual metadata refresh can retry the contract call.
-
-Manual refresh is intentionally conservative:
-
-1. The API accepts a refresh request for a single `token_address` and `token_id`.
-2. A five-minute cooldown is enforced for that exact token.
-3. The current contract URI is fetched.
-4. If the URI is unchanged, only the token refresh state is updated.
-5. If the URI changed, the indexer infers the old and new base URI.
-6. Only indexed tokens whose URI still starts with the old base URI are updated to the new base URI.
-
-Base URI changes are not a universal ERC-721 event standard, so this behavior is based on comparing the refreshed token URI against the stored URI. This avoids rewriting an entire collection unless the checked token actually changed.
+Base URI changes are not a universal ERC-721 event standard. `aether-indexer` therefore updates a collection base URI only when a requested token refresh proves that the token URI changed and the old/new base URI can be inferred safely.
 
 ## Local Development
 
