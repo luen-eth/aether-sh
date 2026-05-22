@@ -200,30 +200,30 @@ flowchart TD
 
 ## PostgreSQL
 
-By default, Docker Compose starts a local PostgreSQL service and the application connects to it automatically.
+By default, Docker Compose starts only the indexer service. Set `AETHER_DATABASE_URL` to connect to an external PostgreSQL server, which is the recommended setup for Dokploy and other managed deployments.
 
 On startup, Aether Indexer runs its schema migration automatically. If the target database in `AETHER_DATABASE_URL` does not exist, the application first tries to connect to the `postgres` maintenance database and create the missing database before running migrations. This helps Dokploy and other persistent-volume deployments recover when a PostgreSQL data directory already exists but the expected application database is missing.
 
-To use an external PostgreSQL server while keeping the default Compose file, set `AETHER_DATABASE_URL` in `.env`:
+To use an external PostgreSQL server, set `AETHER_DATABASE_URL` in `.env`:
 
 ```env
 AETHER_RPC_HTTP_URL=https://arb1.arbitrum.io/rpc
 AETHER_DATABASE_URL=postgres://user:password@postgres.example.com:5432/aether_indexer
 ```
 
-If `AETHER_DATABASE_URL` is omitted, Docker Compose uses:
+When `AETHER_DATABASE_URL` is set, the bundled PostgreSQL service is not started.
+
+To use the bundled PostgreSQL service for local Docker Compose runs, enable the `bundled-postgres` profile and omit `AETHER_DATABASE_URL`:
+
+```env
+COMPOSE_PROFILES=bundled-postgres
+```
+
+With the bundled profile enabled, Docker Compose uses:
 
 ```env
 postgres://postgres:postgres@postgres:5432/aether_indexer
 ```
-
-To run only the indexer container and skip the bundled PostgreSQL service, use:
-
-```bash
-docker compose -f docker-compose.external-postgres.yml up -d --build
-```
-
-This mode requires `AETHER_DATABASE_URL` in `.env`.
 
 For external PostgreSQL servers, the configured user must either have permission to create the target database or the database must be created before the service starts.
 
@@ -236,7 +236,7 @@ The Docker Compose defaults are suitable for Arbitrum One testing. Values can be
 | `AETHER_RPC_HTTP_URL` | Yes | None | Primary EVM HTTP RPC endpoint |
 | `AETHER_RPC_HTTP_URL_2` | No | None | First backup RPC endpoint |
 | `AETHER_RPC_HTTP_URL_3` | No | None | Second backup RPC endpoint |
-| `AETHER_DATABASE_URL` | No in Docker, yes locally | Bundled PostgreSQL URL | PostgreSQL connection string |
+| `AETHER_DATABASE_URL` | Yes unless `COMPOSE_PROFILES=bundled-postgres` is enabled | Bundled PostgreSQL URL only with the bundled profile | PostgreSQL connection string |
 | `AETHER_CHAIN_ID` | No | `42161` in Docker | EVM chain ID |
 | `AETHER_START_BLOCK` | No | `0` | First block to index |
 | `AETHER_CONFIRMATIONS` | No | `20` in Docker | Blocks kept behind the head before indexing |
