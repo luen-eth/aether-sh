@@ -77,7 +77,7 @@ impl AppConfig {
             chain_id: env_parse("AETHER_CHAIN_ID", 1)?,
             start_block: env_parse("AETHER_START_BLOCK", 0)?,
             confirmations: env_parse("AETHER_CONFIRMATIONS", 12)?,
-            chunk_size: env_parse("AETHER_CHUNK_SIZE", 1_000)?,
+            chunk_size: env_parse("AETHER_CHUNK_SIZE", 10_000)?,
             poll_interval_ms: env_parse("AETHER_POLL_INTERVAL_MS", 4_000)?,
             request_timeout_ms: env_parse("AETHER_RPC_TIMEOUT_MS", 20_000)?,
             rate_limit_backoff_ms: env_parse("AETHER_RPC_RATE_LIMIT_BACKOFF_MS", 1_000)?,
