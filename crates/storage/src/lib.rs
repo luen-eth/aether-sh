@@ -5,7 +5,7 @@ use common::{
 use sqlx::{FromRow, PgPool, QueryBuilder, Row, postgres::PgPoolOptions};
 use std::collections::{HashSet, HashMap};
 use thiserror::Error;
-use tracing::info;
+use tracing::{info, warn};
 use url::Url;
 
 const MIGRATION_SQL: &str = r#"
@@ -204,7 +204,7 @@ impl Store {
         Ok(())
     }
 
-    pub async fn ingest_transfers(
+    pub async fn ingest_transfers_raw(
         &self,
         transfers: &[TransferEvent],
     ) -> Result<IngestSummary, StorageError> {
@@ -217,7 +217,7 @@ impl Store {
 
         let mut tx = self.pool.begin().await.map_err(StorageError::Query)?;
 
-        // 1. Bulk Upsert Assets
+        // 1. Bulk Upsert Assets (in chunks of 2000)
         let mut unique_assets_map = HashMap::new();
         for transfer in transfers {
             let entry = unique_assets_map
@@ -229,25 +229,27 @@ impl Store {
         }
 
         if !unique_assets_map.is_empty() {
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "INSERT INTO assets (address, standard, first_seen_block) "
-            );
             let unique_assets: Vec<_> = unique_assets_map
                 .into_iter()
                 .map(|(addr, (std, block))| (addr, std, block))
                 .collect();
 
-            query_builder.push_values(unique_assets, |mut b, (addr, std, block)| {
-                b.push_bind(addr)
-                 .push_bind(std.as_str())
-                 .push_bind(block as i64);
-            });
-            query_builder.push(" ON CONFLICT (address) DO UPDATE SET standard = EXCLUDED.standard, updated_at = NOW()");
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
+            for chunk in unique_assets.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO assets (address, standard, first_seen_block) "
+                );
+                query_builder.push_values(chunk.to_vec(), |mut b, (addr, std, block)| {
+                    b.push_bind(addr)
+                     .push_bind(std.as_str())
+                     .push_bind(block as i64);
+                });
+                query_builder.push(" ON CONFLICT (address) DO UPDATE SET standard = EXCLUDED.standard, updated_at = NOW()");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
+            }
         }
 
-        // 2. Bulk Insert Transfers with RETURNING
+        // 2. Bulk Insert Transfers with RETURNING (in chunks of 1000 to prevent 65,535 parameter limit)
         #[derive(sqlx::FromRow, Hash, PartialEq, Eq, Debug)]
         struct InsertedTransferKey {
             chain_id: i64,
@@ -256,52 +258,58 @@ impl Store {
             batch_index: i32,
         }
 
-        let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-            "INSERT INTO transfers (chain_id, block_number, block_hash, tx_hash, log_index, batch_index, token_address, standard, from_address, to_address, token_id, value_numeric, indexed_at) "
-        );
-        query_builder.push("VALUES ");
-        for (i, transfer) in transfers.iter().enumerate() {
-            if i > 0 {
-                query_builder.push(", ");
-            }
-            let batch_index = transfer.batch_index.map(|v| v as i32).unwrap_or(-1);
-            query_builder.push("(");
-            query_builder.push_bind(transfer.chain_id as i64);
-            query_builder.push(", ");
-            query_builder.push_bind(transfer.block_number as i64);
-            query_builder.push(", ");
-            query_builder.push_bind(&transfer.block_hash);
-            query_builder.push(", ");
-            query_builder.push_bind(&transfer.tx_hash);
-            query_builder.push(", ");
-            query_builder.push_bind(transfer.log_index as i64);
-            query_builder.push(", ");
-            query_builder.push_bind(batch_index);
-            query_builder.push(", ");
-            query_builder.push_bind(&transfer.token_address);
-            query_builder.push(", ");
-            query_builder.push_bind(transfer.standard.as_str());
-            query_builder.push(", ");
-            query_builder.push_bind(&transfer.from_address);
-            query_builder.push(", ");
-            query_builder.push_bind(&transfer.to_address);
-            query_builder.push(", ");
-            query_builder.push_bind(transfer.token_id.as_deref());
-            query_builder.push(", CAST(");
-            query_builder.push_bind(&transfer.value);
-            query_builder.push(" AS NUMERIC(78,0)), ");
-            query_builder.push_bind(transfer.indexed_at);
-            query_builder.push(")");
-        }
-        query_builder.push(" ON CONFLICT (chain_id, tx_hash, log_index, batch_index) DO NOTHING ");
-        query_builder.push(" RETURNING chain_id, tx_hash, log_index, batch_index ");
+        let mut inserted_set = HashSet::new();
 
-        let query = query_builder.build_query_as::<InsertedTransferKey>();
-        let inserted_keys = query.fetch_all(&mut *tx).await.map_err(StorageError::Query)?;
-        let inserted_set: HashSet<_> = inserted_keys.into_iter().collect();
+        for chunk in transfers.chunks(1000) {
+            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "INSERT INTO transfers (chain_id, block_number, block_hash, tx_hash, log_index, batch_index, token_address, standard, from_address, to_address, token_id, value_numeric, indexed_at) "
+            );
+            query_builder.push("VALUES ");
+            for (i, transfer) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query_builder.push(", ");
+                }
+                let batch_index = transfer.batch_index.map(|v| v as i32).unwrap_or(-1);
+                query_builder.push("(");
+                query_builder.push_bind(transfer.chain_id as i64);
+                query_builder.push(", ");
+                query_builder.push_bind(transfer.block_number as i64);
+                query_builder.push(", ");
+                query_builder.push_bind(&transfer.block_hash);
+                query_builder.push(", ");
+                query_builder.push_bind(&transfer.tx_hash);
+                query_builder.push(", ");
+                query_builder.push_bind(transfer.log_index as i64);
+                query_builder.push(", ");
+                query_builder.push_bind(batch_index);
+                query_builder.push(", ");
+                query_builder.push_bind(&transfer.token_address);
+                query_builder.push(", ");
+                query_builder.push_bind(transfer.standard.as_str());
+                query_builder.push(", ");
+                query_builder.push_bind(&transfer.from_address);
+                query_builder.push(", ");
+                query_builder.push_bind(&transfer.to_address);
+                query_builder.push(", ");
+                query_builder.push_bind(transfer.token_id.as_deref());
+                query_builder.push(", CAST(");
+                query_builder.push_bind(&transfer.value);
+                query_builder.push(" AS NUMERIC(78,0)), ");
+                query_builder.push_bind(transfer.indexed_at);
+                query_builder.push(")");
+            }
+            query_builder.push(" ON CONFLICT (chain_id, tx_hash, log_index, batch_index) DO NOTHING ");
+            query_builder.push(" RETURNING chain_id, tx_hash, log_index, batch_index ");
+
+            let query = query_builder.build_query_as::<InsertedTransferKey>();
+            let inserted_keys = query.fetch_all(&mut *tx).await.map_err(StorageError::Query)?;
+            for key in inserted_keys {
+                inserted_set.insert(key);
+            }
+        }
         let inserted = inserted_set.len();
 
-        // 3. Bulk Insert NFT Tokens for new transfers
+        // 3. Bulk Insert NFT Tokens for new transfers (in chunks of 2000)
         let mut nft_tokens_map = HashMap::new();
         for transfer in transfers {
             let batch_index = transfer.batch_index.map(|v| v as i32).unwrap_or(-1);
@@ -324,28 +332,31 @@ impl Store {
         }
 
         if !nft_tokens_map.is_empty() {
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "INSERT INTO nft_tokens (token_address, token_id, standard, uri_status, updated_at) "
-            );
-            query_builder.push("VALUES ");
-            for (i, ((token_addr, token_id), std)) in nft_tokens_map.iter().enumerate() {
-                if i > 0 {
+            let nft_tokens_vec: Vec<_> = nft_tokens_map.iter().collect();
+            for chunk in nft_tokens_vec.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO nft_tokens (token_address, token_id, standard, uri_status, updated_at) "
+                );
+                query_builder.push("VALUES ");
+                for (i, ((token_addr, token_id), std)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("(");
+                    query_builder.push_bind(token_addr);
                     query_builder.push(", ");
+                    query_builder.push_bind(token_id);
+                    query_builder.push(", ");
+                    query_builder.push_bind(std.as_str());
+                    query_builder.push(", 'pending', NOW())");
                 }
-                query_builder.push("(");
-                query_builder.push_bind(token_addr);
-                query_builder.push(", ");
-                query_builder.push_bind(token_id);
-                query_builder.push(", ");
-                query_builder.push_bind(std.as_str());
-                query_builder.push(", 'pending', NOW())");
+                query_builder.push(" ON CONFLICT (token_address, token_id) DO UPDATE SET standard = EXCLUDED.standard, updated_at = NOW()");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
-            query_builder.push(" ON CONFLICT (token_address, token_id) DO UPDATE SET standard = EXCLUDED.standard, updated_at = NOW()");
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
         }
 
-        // 4. Group ERC-721 Transfers for Ownership Updates
+        // 4. Group ERC-721 Transfers for Ownership Updates (in chunks of 2000)
         let mut latest_erc721_transfers = HashMap::new();
         for transfer in transfers {
             if transfer.standard != AssetStandard::Erc721 {
@@ -387,47 +398,51 @@ impl Store {
         }
 
         if !erc721_upserts.is_empty() {
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "INSERT INTO nft_ownerships (token_address, token_id, owner_address, updated_at) "
-            );
-            query_builder.push("VALUES ");
-            for (i, (token_addr, token_id, owner)) in erc721_upserts.iter().enumerate() {
-                if i > 0 {
+            for chunk in erc721_upserts.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO nft_ownerships (token_address, token_id, owner_address, updated_at) "
+                );
+                query_builder.push("VALUES ");
+                for (i, (token_addr, token_id, owner)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("(");
+                    query_builder.push_bind(token_addr);
                     query_builder.push(", ");
+                    query_builder.push_bind(token_id);
+                    query_builder.push(", ");
+                    query_builder.push_bind(owner);
+                    query_builder.push(", NOW())");
                 }
-                query_builder.push("(");
-                query_builder.push_bind(token_addr);
-                query_builder.push(", ");
-                query_builder.push_bind(token_id);
-                query_builder.push(", ");
-                query_builder.push_bind(owner);
-                query_builder.push(", NOW())");
+                query_builder.push(" ON CONFLICT (token_address, token_id) DO UPDATE SET owner_address = EXCLUDED.owner_address, updated_at = NOW()");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
-            query_builder.push(" ON CONFLICT (token_address, token_id) DO UPDATE SET owner_address = EXCLUDED.owner_address, updated_at = NOW()");
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
         }
 
         if !erc721_deletes.is_empty() {
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "DELETE FROM nft_ownerships WHERE (token_address, token_id) IN ("
-            );
-            for (i, (token_addr, token_id)) in erc721_deletes.iter().enumerate() {
-                if i > 0 {
+            for chunk in erc721_deletes.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "DELETE FROM nft_ownerships WHERE (token_address, token_id) IN ("
+                );
+                for (i, (token_addr, token_id)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("(");
+                    query_builder.push_bind(token_addr);
                     query_builder.push(", ");
+                    query_builder.push_bind(token_id);
+                    query_builder.push(")");
                 }
-                query_builder.push("(");
-                query_builder.push_bind(token_addr);
-                query_builder.push(", ");
-                query_builder.push_bind(token_id);
                 query_builder.push(")");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
-            query_builder.push(")");
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
         }
 
-        // 5. Group and bulk upsert ERC-20 balance changes
+        // 5. Group and bulk upsert ERC-20 balance changes (in chunks of 1500)
         let mut erc20_changes = Vec::new();
         for transfer in transfers {
             if transfer.standard != AssetStandard::Erc20 {
@@ -459,51 +474,55 @@ impl Store {
             }
             let unique_user_tokens_vec: Vec<_> = unique_user_tokens.into_iter().collect();
 
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "INSERT INTO token_balances (token_address, holder_address, balance_numeric, updated_at) "
-            );
-            query_builder.push("VALUES ");
-            for (i, (token_addr, holder)) in unique_user_tokens_vec.iter().enumerate() {
-                if i > 0 {
+            for chunk in unique_user_tokens_vec.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO token_balances (token_address, holder_address, balance_numeric, updated_at) "
+                );
+                query_builder.push("VALUES ");
+                for (i, (token_addr, holder)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("(");
+                    query_builder.push_bind(token_addr);
                     query_builder.push(", ");
+                    query_builder.push_bind(holder);
+                    query_builder.push(", 0, NOW())");
                 }
-                query_builder.push("(");
-                query_builder.push_bind(token_addr);
-                query_builder.push(", ");
-                query_builder.push_bind(holder);
-                query_builder.push(", 0, NOW())");
+                query_builder.push(" ON CONFLICT (token_address, holder_address) DO NOTHING");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
-            query_builder.push(" ON CONFLICT (token_address, holder_address) DO NOTHING");
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
 
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "INSERT INTO token_balances (token_address, holder_address, balance_numeric, updated_at) "
-            );
-            query_builder.push(
-                "SELECT v.token_address, v.holder_address, GREATEST(COALESCE(tb.balance_numeric, 0) + SUM(CAST(v.change AS NUMERIC(78,0))), 0), NOW() \
-                 FROM ("
-            );
-            for (i, (token_addr, holder, change)) in erc20_changes.iter().enumerate() {
-                if i > 0 {
+            for chunk in erc20_changes.chunks(1500) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO token_balances (token_address, holder_address, balance_numeric, updated_at) "
+                );
+                query_builder.push(
+                    "SELECT v.token_address, v.holder_address, GREATEST(COALESCE(tb.balance_numeric, 0) + SUM(CAST(v.change AS NUMERIC(78,0))), 0), NOW() \
+                     FROM ("
+                );
+                for (i, (token_addr, holder, change)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("VALUES (");
+                    query_builder.push_bind(token_addr);
                     query_builder.push(", ");
+                    query_builder.push_bind(holder);
+                    query_builder.push(", ");
+                    query_builder.push_bind(change);
+                    query_builder.push(")");
                 }
-                query_builder.push("VALUES (");
-                query_builder.push_bind(token_addr);
-                query_builder.push(", ");
-                query_builder.push_bind(holder);
-                query_builder.push(", ");
-                query_builder.push_bind(change);
-                query_builder.push(")");
+                query_builder.push(") AS v(token_address, holder_address, change) \
+                                LEFT JOIN token_balances tb USING (token_address, holder_address) \
+                                GROUP BY v.token_address, v.holder_address, tb.balance_numeric \
+                                ON CONFLICT (token_address, holder_address) \
+                                DO UPDATE SET balance_numeric = EXCLUDED.balance_numeric, updated_at = NOW()");
+                
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
-            query_builder.push(") AS v(token_address, holder_address, change) \
-                            LEFT JOIN token_balances tb USING (token_address, holder_address) \
-                            GROUP BY v.token_address, v.holder_address, tb.balance_numeric \
-                            ON CONFLICT (token_address, holder_address) \
-                            DO UPDATE SET balance_numeric = EXCLUDED.balance_numeric, updated_at = NOW()");
-            
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
 
             sqlx::query("DELETE FROM token_balances WHERE balance_numeric = 0")
                 .execute(&mut *tx)
@@ -511,7 +530,7 @@ impl Store {
                 .map_err(StorageError::Query)?;
         }
 
-        // 6. Group and bulk upsert ERC-1155 balance changes
+        // 6. Group and bulk upsert ERC-1155 balance changes (in chunks of 1500)
         let mut erc1155_changes = Vec::new();
         for transfer in transfers {
             if transfer.standard != AssetStandard::Erc1155 {
@@ -548,55 +567,59 @@ impl Store {
             }
             let unique_user_nft_tokens_vec: Vec<_> = unique_user_nft_tokens.into_iter().collect();
 
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "INSERT INTO nft_balances (token_address, token_id, holder_address, balance_numeric, updated_at) "
-            );
-            query_builder.push("VALUES ");
-            for (i, (token_addr, token_id, holder)) in unique_user_nft_tokens_vec.iter().enumerate() {
-                if i > 0 {
+            for chunk in unique_user_nft_tokens_vec.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO nft_balances (token_address, token_id, holder_address, balance_numeric, updated_at) "
+                );
+                query_builder.push("VALUES ");
+                for (i, (token_addr, token_id, holder)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("(");
+                    query_builder.push_bind(token_addr);
                     query_builder.push(", ");
+                    query_builder.push_bind(token_id);
+                    query_builder.push(", ");
+                    query_builder.push_bind(holder);
+                    query_builder.push(", 0, NOW())");
                 }
-                query_builder.push("(");
-                query_builder.push_bind(token_addr);
-                query_builder.push(", ");
-                query_builder.push_bind(token_id);
-                query_builder.push(", ");
-                query_builder.push_bind(holder);
-                query_builder.push(", 0, NOW())");
+                query_builder.push(" ON CONFLICT (token_address, token_id, holder_address) DO NOTHING");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
-            query_builder.push(" ON CONFLICT (token_address, token_id, holder_address) DO NOTHING");
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
 
-            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                "INSERT INTO nft_balances (token_address, token_id, holder_address, balance_numeric, updated_at) "
-            );
-            query_builder.push(
-                "SELECT v.token_address, v.token_id, v.holder_address, GREATEST(COALESCE(nb.balance_numeric, 0) + SUM(CAST(v.change AS NUMERIC(78,0))), 0), NOW() \
-                 FROM ("
-            );
-            for (i, (token_addr, token_id, holder, change)) in erc1155_changes.iter().enumerate() {
-                if i > 0 {
+            for chunk in erc1155_changes.chunks(1500) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "INSERT INTO nft_balances (token_address, token_id, holder_address, balance_numeric, updated_at) "
+                );
+                query_builder.push(
+                    "SELECT v.token_address, v.token_id, v.holder_address, GREATEST(COALESCE(nb.balance_numeric, 0) + SUM(CAST(v.change AS NUMERIC(78,0))), 0), NOW() \
+                     FROM ("
+                );
+                for (i, (token_addr, token_id, holder, change)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("VALUES (");
+                    query_builder.push_bind(token_addr);
                     query_builder.push(", ");
+                    query_builder.push_bind(token_id);
+                    query_builder.push(", ");
+                    query_builder.push_bind(holder);
+                    query_builder.push(", ");
+                    query_builder.push_bind(change);
+                    query_builder.push(")");
                 }
-                query_builder.push("VALUES (");
-                query_builder.push_bind(token_addr);
-                query_builder.push(", ");
-                query_builder.push_bind(token_id);
-                query_builder.push(", ");
-                query_builder.push_bind(holder);
-                query_builder.push(", ");
-                query_builder.push_bind(change);
-                query_builder.push(")");
+                query_builder.push(") AS v(token_address, token_id, holder_address, change) \
+                                LEFT JOIN nft_balances nb USING (token_address, token_id, holder_address) \
+                                GROUP BY v.token_address, v.token_id, v.holder_address, nb.balance_numeric \
+                                ON CONFLICT (token_address, token_id, holder_address) \
+                                DO UPDATE SET balance_numeric = EXCLUDED.balance_numeric, updated_at = NOW()");
+                
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
-            query_builder.push(") AS v(token_address, token_id, holder_address, change) \
-                            LEFT JOIN nft_balances nb USING (token_address, token_id, holder_address) \
-                            GROUP BY v.token_address, v.token_id, v.holder_address, nb.balance_numeric \
-                            ON CONFLICT (token_address, token_id, holder_address) \
-                            DO UPDATE SET balance_numeric = EXCLUDED.balance_numeric, updated_at = NOW()");
-            
-            let query = query_builder.build();
-            query.execute(&mut *tx).await.map_err(StorageError::Query)?;
 
             sqlx::query("DELETE FROM nft_balances WHERE balance_numeric = 0")
                 .execute(&mut *tx)
@@ -618,6 +641,55 @@ impl Store {
         Ok(IngestSummary {
             inserted_transfers: inserted,
             nft_tokens_to_fetch,
+        })
+    }
+
+    pub async fn ingest_transfers(
+        &self,
+        transfers: &[TransferEvent],
+    ) -> Result<IngestSummary, StorageError> {
+        if transfers.is_empty() {
+            return Ok(IngestSummary {
+                inserted_transfers: 0,
+                nft_tokens_to_fetch: Vec::new(),
+            });
+        }
+
+        let mut total_inserted = 0;
+        let mut total_nft_tokens = Vec::new();
+
+        let mut queue = vec![transfers];
+        while let Some(current) = queue.pop() {
+            if current.is_empty() {
+                continue;
+            }
+
+            match self.ingest_transfers_raw(current).await {
+                Ok(summary) => {
+                    total_inserted += summary.inserted_transfers;
+                    total_nft_tokens.extend(summary.nft_tokens_to_fetch);
+                }
+                Err(err) => {
+                    if current.len() > 1 {
+                        warn!(
+                            transfers_count = current.len(),
+                            error = %err,
+                            "bulk ingestion of transfers failed, splitting batch in half recursively"
+                        );
+                        let mid = current.len() / 2;
+                        let (left, right) = current.split_at(mid);
+                        queue.push(right);
+                        queue.push(left);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Ok(IngestSummary {
+            inserted_transfers: total_inserted,
+            nft_tokens_to_fetch: total_nft_tokens,
         })
     }
 
@@ -910,7 +982,7 @@ impl Store {
         Ok(row.map(|r| (r.get("token_id"), r.get("token_uri"))))
     }
 
-    pub async fn set_nft_token_uris(
+    pub async fn set_nft_token_uris_raw(
         &self,
         token_address: &str,
         standard: AssetStandard,
@@ -946,7 +1018,46 @@ impl Store {
         Ok(())
     }
 
-    pub async fn mark_nft_token_uris_fetch_failed(
+    pub async fn set_nft_token_uris(
+        &self,
+        token_address: &str,
+        standard: AssetStandard,
+        items: &[(&str, &str)],
+    ) -> Result<(), StorageError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut queue = vec![items];
+        while let Some(current) = queue.pop() {
+            if current.is_empty() {
+                continue;
+            }
+
+            match self.set_nft_token_uris_raw(token_address, standard, current).await {
+                Ok(()) => {}
+                Err(err) => {
+                    if current.len() > 1 {
+                        warn!(
+                            token_address = %token_address,
+                            items_count = current.len(),
+                            error = %err,
+                            "bulk insertion of NFT URIs failed, splitting batch in half recursively"
+                        );
+                        let mid = current.len() / 2;
+                        let (left, right) = current.split_at(mid);
+                        queue.push(right);
+                        queue.push(left);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn mark_nft_token_uris_fetch_failed_raw(
         &self,
         items: &[(&str, &str, &str)],
     ) -> Result<(), StorageError> {
@@ -974,6 +1085,42 @@ impl Store {
 
         let query = query_builder.build();
         query.execute(&self.pool).await.map_err(StorageError::Query)?;
+        Ok(())
+    }
+
+    pub async fn mark_nft_token_uris_fetch_failed(
+        &self,
+        items: &[(&str, &str, &str)],
+    ) -> Result<(), StorageError> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut queue = vec![items];
+        while let Some(current) = queue.pop() {
+            if current.is_empty() {
+                continue;
+            }
+
+            match self.mark_nft_token_uris_fetch_failed_raw(current).await {
+                Ok(()) => {}
+                Err(err) => {
+                    if current.len() > 1 {
+                        warn!(
+                            items_count = current.len(),
+                            error = %err,
+                            "bulk NFT URIs failure marking failed, splitting batch in half recursively"
+                        );
+                        let mid = current.len() / 2;
+                        let (left, right) = current.split_at(mid);
+                        queue.push(right);
+                        queue.push(left);
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
