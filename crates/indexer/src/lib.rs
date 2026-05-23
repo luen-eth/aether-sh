@@ -127,8 +127,10 @@ impl IndexerService {
         let logs = self.rpc.get_transfer_logs(from_block, to_block).await?;
         let transfers = parse_transfer_logs(self.config.chain_id, &logs)?;
         let summary = self.store.ingest_transfers(&transfers).await?;
-        self.fetch_detected_nft_token_uris(&summary.nft_tokens_to_fetch)
-            .await;
+        if self.config.enable_auto_metadata_fetch {
+            self.fetch_detected_nft_token_uris(&summary.nft_tokens_to_fetch)
+                .await;
+        }
         self.store.set_last_scanned_block(to_block).await?;
 
         info!(

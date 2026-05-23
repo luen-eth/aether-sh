@@ -81,6 +81,7 @@ impl AppConfig {
             poll_interval_ms: env_parse("AETHER_POLL_INTERVAL_MS", 4_000)?,
             request_timeout_ms: env_parse("AETHER_RPC_TIMEOUT_MS", 20_000)?,
             rate_limit_backoff_ms: env_parse("AETHER_RPC_RATE_LIMIT_BACKOFF_MS", 1_000)?,
+            enable_auto_metadata_fetch: env_parse("AETHER_ENABLE_AUTO_METADATA_FETCH", true)?,
         };
 
         let database = DatabaseConfig {
@@ -112,6 +113,7 @@ pub struct ChainConfig {
     pub poll_interval_ms: u64,
     pub request_timeout_ms: u64,
     pub rate_limit_backoff_ms: u64,
+    pub enable_auto_metadata_fetch: bool,
 }
 
 impl ChainConfig {
