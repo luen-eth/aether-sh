@@ -868,32 +868,34 @@ impl Store {
             return Ok(Vec::new());
         }
 
-        let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-            "SELECT token_address, token_id, standard FROM nft_tokens WHERE token_uri IS NULL AND uri_status = 'pending' AND (token_address, token_id) IN ("
-        );
-        for (i, token) in tokens.iter().enumerate() {
-            if i > 0 {
+        let mut out = Vec::new();
+        for chunk in tokens.chunks(1000) {
+            let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                "SELECT token_address, token_id, standard FROM nft_tokens WHERE token_uri IS NULL AND uri_status = 'pending' AND (token_address, token_id) IN ("
+            );
+            for (i, token) in chunk.iter().enumerate() {
+                if i > 0 {
+                    query_builder.push(", ");
+                }
+                query_builder.push("(");
+                query_builder.push_bind(normalize_address(&token.token_address));
                 query_builder.push(", ");
+                query_builder.push_bind(&token.token_id);
+                query_builder.push(")");
             }
-            query_builder.push("(");
-            query_builder.push_bind(normalize_address(&token.token_address));
-            query_builder.push(", ");
-            query_builder.push_bind(&token.token_id);
             query_builder.push(")");
-        }
-        query_builder.push(")");
 
-        let query = query_builder.build();
-        let rows = query.fetch_all(&self.pool).await.map_err(StorageError::Query)?;
+            let query = query_builder.build();
+            let rows = query.fetch_all(&self.pool).await.map_err(StorageError::Query)?;
 
-        let mut out = Vec::with_capacity(rows.len());
-        for row in rows {
-            let standard_str: String = row.get("standard");
-            out.push(NftTokenKey {
-                token_address: row.get("token_address"),
-                token_id: row.get("token_id"),
-                standard: parse_standard(&standard_str)?,
-            });
+            for row in rows {
+                let standard_str: String = row.get("standard");
+                out.push(NftTokenKey {
+                    token_address: row.get("token_address"),
+                    token_id: row.get("token_id"),
+                    standard: parse_standard(&standard_str)?,
+                });
+            }
         }
         Ok(out)
     }
