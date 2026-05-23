@@ -1,10 +1,12 @@
 use common::ChainConfig;
 use parser::{ParseError, parse_transfer_logs};
 use rpc::{RpcClient, RpcError};
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap};
+use std::sync::Arc;
 use storage::{NftTokenKey, StorageError, Store};
 use thiserror::Error;
 use tokio::sync::watch;
+use tokio::task::JoinSet;
 use tracing::{debug, info, warn};
 
 #[derive(Clone)]
@@ -142,68 +144,206 @@ impl IndexerService {
     }
 
     async fn fetch_detected_nft_token_uris(&self, tokens: &[NftTokenKey]) {
-        for token in tokens {
-            let pending = match self
-                .store
-                .nft_token_for_initial_uri_fetch(&token.token_address, &token.token_id)
-                .await
-            {
-                Ok(Some(pending)) => pending,
-                Ok(None) => continue,
-                Err(err) => {
-                    warn!(
-                        token_address = %token.token_address,
-                        token_id = %token.token_id,
-                        error = %err,
-                        "failed to inspect NFT token URI fetch state"
-                    );
-                    continue;
-                }
-            };
+        let pending_tokens = match self.store.nft_tokens_for_initial_uri_fetch(tokens).await {
+            Ok(pending) => pending,
+            Err(err) => {
+                warn!(error = %err, "failed to inspect NFT token URI fetch states");
+                return;
+            }
+        };
 
-            match self
-                .rpc
-                .token_uri(pending.standard, &pending.token_address, &pending.token_id)
-                .await
-            {
-                Ok(token_uri) => {
-                    if let Err(err) = self
-                        .store
-                        .set_nft_token_uri(
-                            &pending.token_address,
-                            &pending.token_id,
-                            pending.standard,
-                            &token_uri,
-                        )
-                        .await
-                    {
+        if pending_tokens.is_empty() {
+            return;
+        }
+
+        // Group pending tokens by token_address (collection)
+        let mut collections: HashMap<String, Vec<NftTokenKey>> = HashMap::new();
+        for pending in pending_tokens {
+            collections.entry(pending.token_address.clone()).or_default().push(pending);
+        }
+
+        let mut join_set = JoinSet::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(10)); // limit concurrency to 10 collections at once
+
+        for (token_address, pending_list) in collections {
+            let rpc = self.rpc.clone();
+            let store = self.store.clone();
+            let sem = semaphore.clone();
+
+            join_set.spawn(async move {
+                let _permit = sem.acquire().await;
+                
+                // 1. Try to fetch an existing example from DB
+                let mut inferred = None;
+                match store.example_nft_token_uri(&token_address).await {
+                    Ok(Some((example_id, example_uri))) => {
+                        inferred = infer_prefix_suffix(&example_uri, &example_id);
+                    }
+                    Err(err) => {
                         warn!(
-                            token_address = %pending.token_address,
-                            token_id = %pending.token_id,
+                            token_address = %token_address,
                             error = %err,
-                            "failed to persist NFT token URI"
+                            "failed to look up example token URI from database"
                         );
                     }
+                    _ => {}
                 }
-                Err(err) => {
-                    let _ = self
-                        .store
-                        .mark_nft_token_uri_fetch_failed(
-                            &pending.token_address,
-                            &pending.token_id,
-                            &err.to_string(),
-                        )
-                        .await;
-                    warn!(
-                        token_address = %pending.token_address,
-                        token_id = %pending.token_id,
-                        error = %err,
-                        "failed to fetch NFT token URI"
-                    );
+
+                // If not inferred from DB, we fetch exactly ONE token URI from RPC
+                let mut fetched_first_item = None;
+                if inferred.is_none() && !pending_list.is_empty() {
+                    let first = &pending_list[0];
+                    match rpc.token_uri(first.standard, &first.token_address, &first.token_id).await {
+                        Ok(token_uri) => {
+                            inferred = infer_prefix_suffix(&token_uri, &first.token_id);
+                            fetched_first_item = Some((first.token_id.clone(), token_uri));
+                        }
+                        Err(err) => {
+                            let error_str = err.to_string();
+                            let items_to_fail: Vec<_> = pending_list
+                                .iter()
+                                .map(|t| (t.token_address.as_str(), t.token_id.as_str(), error_str.as_str()))
+                                .collect();
+                            let _ = store.mark_nft_token_uris_fetch_failed(&items_to_fail).await;
+                            warn!(
+                                token_address = %token_address,
+                                error = %err,
+                                "failed to fetch first NFT token URI, marked collection as failed"
+                            );
+                            return;
+                        }
+                    }
                 }
+
+                // 2. Perform propagation if inferred
+                if let Some((prefix, suffix)) = inferred {
+                    let standard = pending_list[0].standard;
+                    let mut calculated_uris = Vec::new();
+                    for item in &pending_list {
+                        if fetched_first_item.as_ref().map(|f| &f.0) == Some(&item.token_id) {
+                            continue;
+                        }
+                        let calculated_uri = format!("{}{}{}", prefix, item.token_id, suffix);
+                        calculated_uris.push(calculated_uri);
+                    }
+
+                    let mut items_to_set = Vec::new();
+                    if let Some((first_id, first_uri)) = &fetched_first_item {
+                        items_to_set.push((first_id.as_str(), first_uri.as_str()));
+                    }
+
+                    let mut calc_iter = calculated_uris.iter();
+                    for item in &pending_list {
+                        if fetched_first_item.as_ref().map(|f| &f.0) == Some(&item.token_id) {
+                            continue;
+                        }
+                        if let Some(uri) = calc_iter.next() {
+                            items_to_set.push((item.token_id.as_str(), uri.as_str()));
+                        }
+                    }
+
+                    if let Err(err) = store.set_nft_token_uris(&token_address, standard, &items_to_set).await {
+                        warn!(
+                            token_address = %token_address,
+                            error = %err,
+                            "failed to persist bulk NFT token URIs"
+                        );
+                    }
+                } else {
+                    // 3. Fallback: fetch individually if custom URIs are used
+                    let mut individual_join_set = JoinSet::new();
+                    let ind_sem = Arc::new(tokio::sync::Semaphore::new(5));
+
+                    for item in pending_list {
+                        let item_rpc = rpc.clone();
+                        let item_store = store.clone();
+                        let item_sem = ind_sem.clone();
+                        
+                        individual_join_set.spawn(async move {
+                            let _permit = item_sem.acquire().await;
+                            match item_rpc.token_uri(item.standard, &item.token_address, &item.token_id).await {
+                                Ok(token_uri) => {
+                                    let _ = item_store.set_nft_token_uri(
+                                        &item.token_address,
+                                        &item.token_id,
+                                        item.standard,
+                                        &token_uri,
+                                    ).await;
+                                }
+                                Err(err) => {
+                                    let _ = item_store.mark_nft_token_uri_fetch_failed(
+                                        &item.token_address,
+                                        &item.token_id,
+                                        &err.to_string(),
+                                    ).await;
+                                }
+                            }
+                        });
+                    }
+
+                    while individual_join_set.join_next().await.is_some() {}
+                }
+            });
+        }
+
+        while join_set.join_next().await.is_some() {}
+    }
+}
+
+fn decimal_to_erc1155_hex_id(token_id: &str) -> String {
+    let trimmed = token_id.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return String::new();
+    }
+
+    let mut nibbles = vec![0u8];
+    for ch in trimmed.bytes() {
+        let digit = ch - b'0';
+        let mut carry = digit as u16;
+        for nibble in &mut nibbles {
+            let value = (*nibble as u16) * 10 + carry;
+            *nibble = (value % 16) as u8;
+            carry = value / 16;
+        }
+        while carry > 0 {
+            nibbles.push((carry % 16) as u8);
+            carry /= 16;
+        }
+    }
+
+    let mut raw = nibbles
+        .into_iter()
+        .rev()
+        .map(|n| char::from_digit(n as u32, 16).unwrap_or('0'))
+        .collect::<String>();
+    if raw.is_empty() {
+        raw.push('0');
+    }
+    format!("{raw:0>64}")
+}
+
+fn infer_prefix_suffix(uri: &str, token_id: &str) -> Option<(String, String)> {
+    let raw_token_id = token_id.trim();
+    if raw_token_id.is_empty() {
+        return None;
+    }
+
+    let markers = [
+        raw_token_id.to_owned(),
+        "{id}".to_owned(),
+        decimal_to_erc1155_hex_id(raw_token_id),
+    ];
+
+    for marker in markers.iter().filter(|m| !m.is_empty()) {
+        if let Some(idx) = uri.rfind(marker) {
+            let prefix = uri[..idx].to_owned();
+            let suffix = uri[idx + marker.len()..].to_owned();
+            if !prefix.is_empty() {
+                return Some((prefix, suffix));
             }
         }
     }
+    None
 }
 
 fn suggested_split_to(err: &RpcError, range_from: u64, range_to: u64) -> Option<u64> {
