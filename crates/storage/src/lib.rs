@@ -500,13 +500,13 @@ impl Store {
                 );
                 query_builder.push(
                     "SELECT v.token_address, v.holder_address, GREATEST(COALESCE(tb.balance_numeric, 0) + SUM(CAST(v.change AS NUMERIC(78,0))), 0), NOW() \
-                     FROM ("
+                     FROM (VALUES "
                 );
                 for (i, (token_addr, holder, change)) in chunk.iter().enumerate() {
                     if i > 0 {
                         query_builder.push(", ");
                     }
-                    query_builder.push("VALUES (");
+                    query_builder.push("(");
                     query_builder.push_bind(token_addr);
                     query_builder.push(", ");
                     query_builder.push_bind(holder);
@@ -595,13 +595,13 @@ impl Store {
                 );
                 query_builder.push(
                     "SELECT v.token_address, v.token_id, v.holder_address, GREATEST(COALESCE(nb.balance_numeric, 0) + SUM(CAST(v.change AS NUMERIC(78,0))), 0), NOW() \
-                     FROM ("
+                     FROM (VALUES "
                 );
                 for (i, (token_addr, token_id, holder, change)) in chunk.iter().enumerate() {
                     if i > 0 {
                         query_builder.push(", ");
                     }
-                    query_builder.push("VALUES (");
+                    query_builder.push("(");
                     query_builder.push_bind(token_addr);
                     query_builder.push(", ");
                     query_builder.push_bind(token_id);
