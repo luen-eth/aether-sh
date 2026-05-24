@@ -524,10 +524,24 @@ impl Store {
                 query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
 
-            sqlx::query("DELETE FROM token_balances WHERE balance_numeric = 0")
-                .execute(&mut *tx)
-                .await
-                .map_err(StorageError::Query)?;
+            for chunk in unique_user_tokens_vec.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "DELETE FROM token_balances WHERE balance_numeric = 0 AND (token_address, holder_address) IN ("
+                );
+                for (i, (token_addr, holder)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("(");
+                    query_builder.push_bind(token_addr);
+                    query_builder.push(", ");
+                    query_builder.push_bind(holder);
+                    query_builder.push(")");
+                }
+                query_builder.push(")");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
+            }
         }
 
         // 6. Group and bulk upsert ERC-1155 balance changes (in chunks of 1500)
@@ -621,10 +635,26 @@ impl Store {
                 query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
 
-            sqlx::query("DELETE FROM nft_balances WHERE balance_numeric = 0")
-                .execute(&mut *tx)
-                .await
-                .map_err(StorageError::Query)?;
+            for chunk in unique_user_nft_tokens_vec.chunks(2000) {
+                let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
+                    "DELETE FROM nft_balances WHERE balance_numeric = 0 AND (token_address, token_id, holder_address) IN ("
+                );
+                for (i, (token_addr, token_id, holder)) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        query_builder.push(", ");
+                    }
+                    query_builder.push("(");
+                    query_builder.push_bind(token_addr);
+                    query_builder.push(", ");
+                    query_builder.push_bind(token_id);
+                    query_builder.push(", ");
+                    query_builder.push_bind(holder);
+                    query_builder.push(")");
+                }
+                query_builder.push(")");
+                let query = query_builder.build();
+                query.execute(&mut *tx).await.map_err(StorageError::Query)?;
+            }
         }
 
         tx.commit().await.map_err(StorageError::Query)?;
