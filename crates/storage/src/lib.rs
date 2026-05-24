@@ -526,7 +526,8 @@ impl Store {
 
             for chunk in unique_user_tokens_vec.chunks(2000) {
                 let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                    "DELETE FROM token_balances WHERE balance_numeric = 0 AND (token_address, holder_address) IN ("
+                    "DELETE FROM token_balances \
+                     USING (VALUES "
                 );
                 for (i, (token_addr, holder)) in chunk.iter().enumerate() {
                     if i > 0 {
@@ -538,7 +539,10 @@ impl Store {
                     query_builder.push_bind(holder);
                     query_builder.push(")");
                 }
-                query_builder.push(")");
+                query_builder.push(") AS v(token_address, holder_address) \
+                                 WHERE token_balances.token_address = v.token_address \
+                                   AND token_balances.holder_address = v.holder_address \
+                                   AND token_balances.balance_numeric = 0");
                 let query = query_builder.build();
                 query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
@@ -637,7 +641,8 @@ impl Store {
 
             for chunk in unique_user_nft_tokens_vec.chunks(2000) {
                 let mut query_builder: QueryBuilder<'_, sqlx::Postgres> = QueryBuilder::new(
-                    "DELETE FROM nft_balances WHERE balance_numeric = 0 AND (token_address, token_id, holder_address) IN ("
+                    "DELETE FROM nft_balances \
+                     USING (VALUES "
                 );
                 for (i, (token_addr, token_id, holder)) in chunk.iter().enumerate() {
                     if i > 0 {
@@ -651,7 +656,11 @@ impl Store {
                     query_builder.push_bind(holder);
                     query_builder.push(")");
                 }
-                query_builder.push(")");
+                query_builder.push(") AS v(token_address, token_id, holder_address) \
+                                 WHERE nft_balances.token_address = v.token_address \
+                                   AND nft_balances.token_id = v.token_id \
+                                   AND nft_balances.holder_address = v.holder_address \
+                                   AND nft_balances.balance_numeric = 0");
                 let query = query_builder.build();
                 query.execute(&mut *tx).await.map_err(StorageError::Query)?;
             }
