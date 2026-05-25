@@ -1,9 +1,9 @@
-use common::ChainConfig;
+use common::{AssetStandard, ChainConfig};
 use parser::{ParseError, parse_transfer_logs};
 use rpc::{RpcClient, RpcError};
-use std::collections::{VecDeque, HashMap};
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use storage::{NftTokenKey, StorageError, Store};
+use storage::{AssetKey, NftTokenKey, StorageError, Store};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -127,6 +127,7 @@ impl IndexerService {
         let logs = self.rpc.get_transfer_logs(from_block, to_block).await?;
         let transfers = parse_transfer_logs(self.config.chain_id, &logs)?;
         let summary = self.store.ingest_transfers(&transfers).await?;
+        self.fetch_new_asset_metadata(&summary.new_assets).await;
         if self.config.enable_auto_metadata_fetch {
             self.fetch_detected_nft_token_uris(&summary.nft_tokens_to_fetch)
                 .await;
@@ -139,10 +140,128 @@ impl IndexerService {
             rpc_logs = logs.len(),
             parsed_transfers = transfers.len(),
             inserted_transfers = summary.inserted_transfers,
+            discovered_assets = summary.new_assets.len(),
             detected_nft_tokens = summary.nft_tokens_to_fetch.len(),
             "indexed block range"
         );
         Ok(())
+    }
+
+    async fn fetch_new_asset_metadata(&self, assets: &[AssetKey]) {
+        if assets.is_empty() {
+            return;
+        }
+
+        let mut discovered = HashMap::new();
+        for asset in assets {
+            if matches!(asset.standard, AssetStandard::Erc20 | AssetStandard::Erc721) {
+                discovered
+                    .entry(asset.token_address.clone())
+                    .or_insert(asset.standard);
+            }
+        }
+        if discovered.is_empty() {
+            return;
+        }
+
+        let mut join_set = JoinSet::new();
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(10));
+
+        for (token_address, standard) in discovered {
+            let rpc = self.rpc.clone();
+            let store = self.store.clone();
+            let sem = semaphore.clone();
+
+            join_set.spawn(async move {
+                let Ok(_permit) = sem.acquire().await else {
+                    return;
+                };
+
+                let name = match rpc.contract_name(&token_address).await {
+                    Ok(value) => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_owned())
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            token_address = %token_address,
+                            standard = %standard,
+                            error = %err,
+                            "failed to fetch token name"
+                        );
+                        None
+                    }
+                };
+
+                let symbol = match rpc.contract_symbol(&token_address).await {
+                    Ok(value) => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed.to_owned())
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            token_address = %token_address,
+                            standard = %standard,
+                            error = %err,
+                            "failed to fetch token symbol"
+                        );
+                        None
+                    }
+                };
+
+                if name.is_none() && symbol.is_none() {
+                    return;
+                }
+
+                if let Err(err) = store
+                    .set_asset_metadata(&token_address, name.as_deref(), symbol.as_deref())
+                    .await
+                {
+                    warn!(
+                        token_address = %token_address,
+                        standard = %standard,
+                        error = %err,
+                        "failed to persist token metadata"
+                    );
+                    return;
+                }
+
+                match (&name, &symbol) {
+                    (Some(name), Some(symbol)) => {
+                        info!(
+                            token_address = %token_address,
+                            standard = %standard,
+                            token_name = %name,
+                            token_symbol = %symbol,
+                            "şu isim ve sembolde token bulundu"
+                        );
+                    }
+                    _ => {
+                        info!(
+                            token_address = %token_address,
+                            standard = %standard,
+                            token_name = name.as_deref().unwrap_or(""),
+                            token_symbol = symbol.as_deref().unwrap_or(""),
+                            "token metadata bulundu (kismi)"
+                        );
+                    }
+                }
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            if let Err(err) = result {
+                warn!(error = %err, "token metadata worker failed");
+            }
+        }
     }
 
     async fn fetch_detected_nft_token_uris(&self, tokens: &[NftTokenKey]) {
@@ -161,7 +280,10 @@ impl IndexerService {
         // Group pending tokens by token_address (collection)
         let mut collections: HashMap<String, Vec<NftTokenKey>> = HashMap::new();
         for pending in pending_tokens {
-            collections.entry(pending.token_address.clone()).or_default().push(pending);
+            collections
+                .entry(pending.token_address.clone())
+                .or_default()
+                .push(pending);
         }
 
         let mut join_set = JoinSet::new();
@@ -174,7 +296,7 @@ impl IndexerService {
 
             join_set.spawn(async move {
                 let _permit = sem.acquire().await;
-                
+
                 // 1. Try to fetch an existing example from DB
                 let mut inferred = None;
                 match store.example_nft_token_uri(&token_address).await {
@@ -195,7 +317,10 @@ impl IndexerService {
                 let mut fetched_first_item = None;
                 if inferred.is_none() && !pending_list.is_empty() {
                     let first = &pending_list[0];
-                    match rpc.token_uri(first.standard, &first.token_address, &first.token_id).await {
+                    match rpc
+                        .token_uri(first.standard, &first.token_address, &first.token_id)
+                        .await
+                    {
                         Ok(token_uri) => {
                             inferred = infer_prefix_suffix(&token_uri, &first.token_id);
                             fetched_first_item = Some((first.token_id.clone(), token_uri));
@@ -204,7 +329,13 @@ impl IndexerService {
                             let error_str = err.to_string();
                             let items_to_fail: Vec<_> = pending_list
                                 .iter()
-                                .map(|t| (t.token_address.as_str(), t.token_id.as_str(), error_str.as_str()))
+                                .map(|t| {
+                                    (
+                                        t.token_address.as_str(),
+                                        t.token_id.as_str(),
+                                        error_str.as_str(),
+                                    )
+                                })
                                 .collect();
                             let _ = store.mark_nft_token_uris_fetch_failed(&items_to_fail).await;
                             warn!(
@@ -244,7 +375,10 @@ impl IndexerService {
                         }
                     }
 
-                    if let Err(err) = store.set_nft_token_uris(&token_address, standard, &items_to_set).await {
+                    if let Err(err) = store
+                        .set_nft_token_uris(&token_address, standard, &items_to_set)
+                        .await
+                    {
                         warn!(
                             token_address = %token_address,
                             error = %err,
@@ -260,24 +394,31 @@ impl IndexerService {
                         let item_rpc = rpc.clone();
                         let item_store = store.clone();
                         let item_sem = ind_sem.clone();
-                        
+
                         individual_join_set.spawn(async move {
                             let _permit = item_sem.acquire().await;
-                            match item_rpc.token_uri(item.standard, &item.token_address, &item.token_id).await {
+                            match item_rpc
+                                .token_uri(item.standard, &item.token_address, &item.token_id)
+                                .await
+                            {
                                 Ok(token_uri) => {
-                                    let _ = item_store.set_nft_token_uri(
-                                        &item.token_address,
-                                        &item.token_id,
-                                        item.standard,
-                                        &token_uri,
-                                    ).await;
+                                    let _ = item_store
+                                        .set_nft_token_uri(
+                                            &item.token_address,
+                                            &item.token_id,
+                                            item.standard,
+                                            &token_uri,
+                                        )
+                                        .await;
                                 }
                                 Err(err) => {
-                                    let _ = item_store.mark_nft_token_uri_fetch_failed(
-                                        &item.token_address,
-                                        &item.token_id,
-                                        &err.to_string(),
-                                    ).await;
+                                    let _ = item_store
+                                        .mark_nft_token_uri_fetch_failed(
+                                            &item.token_address,
+                                            &item.token_id,
+                                            &err.to_string(),
+                                        )
+                                        .await;
                                 }
                             }
                         });

@@ -22,6 +22,8 @@ pub const ERC1155_TRANSFER_BATCH_TOPIC: &str =
     "0x4a39dc06d4c0dbc64b70f7f1d58fca64d4d8105b8f476e2f70f11f3b9f7f62cb";
 const ERC721_TOKEN_URI_SELECTOR: &str = "c87b56dd";
 const ERC1155_URI_SELECTOR: &str = "0e89341c";
+const NAME_SELECTOR: &str = "06fdde03";
+const SYMBOL_SELECTOR: &str = "95d89b41";
 
 #[derive(Debug, Clone)]
 pub struct RpcClient {
@@ -102,6 +104,27 @@ impl RpcClient {
             "data": call_data,
         }, "latest"]);
 
+        let raw: String = self.rpc_call("eth_call", params).await?;
+        decode_abi_string(&raw)
+    }
+
+    pub async fn contract_name(&self, token_address: &str) -> Result<String, RpcError> {
+        self.eth_call_string(token_address, NAME_SELECTOR).await
+    }
+
+    pub async fn contract_symbol(&self, token_address: &str) -> Result<String, RpcError> {
+        self.eth_call_string(token_address, SYMBOL_SELECTOR).await
+    }
+
+    async fn eth_call_string(
+        &self,
+        token_address: &str,
+        selector: &str,
+    ) -> Result<String, RpcError> {
+        let params = json!([{
+            "to": normalize_address(token_address),
+            "data": format!("0x{selector}"),
+        }, "latest"]);
         let raw: String = self.rpc_call("eth_call", params).await?;
         decode_abi_string(&raw)
     }
@@ -309,8 +332,8 @@ pub enum RpcError {
     UnsupportedTokenUriStandard(&'static str),
     #[error("invalid decimal token id: {0}")]
     InvalidTokenId(String),
-    #[error("token URI decode error: {0}")]
-    TokenUriDecode(String),
+    #[error("ABI string decode error: {0}")]
+    AbiStringDecode(String),
 }
 
 impl RpcError {
@@ -444,11 +467,13 @@ fn decode_abi_string(value: &str) -> Result<String, RpcError> {
         .or_else(|| value.strip_prefix("0X"))
         .unwrap_or(value);
     if raw.is_empty() {
-        return Err(RpcError::TokenUriDecode("empty eth_call result".to_owned()));
+        return Err(RpcError::AbiStringDecode(
+            "empty eth_call result".to_owned(),
+        ));
     }
 
     let bytes =
-        hex::decode(raw).map_err(|err| RpcError::TokenUriDecode(format!("invalid hex: {err}")))?;
+        hex::decode(raw).map_err(|err| RpcError::AbiStringDecode(format!("invalid hex: {err}")))?;
     if bytes.len() >= 64 {
         let offset = word_to_usize(&bytes[0..32])?;
         if offset + 32 <= bytes.len() {
@@ -457,7 +482,7 @@ fn decode_abi_string(value: &str) -> Result<String, RpcError> {
             let end = begin.saturating_add(len);
             if end <= bytes.len() {
                 return String::from_utf8(bytes[begin..end].to_vec())
-                    .map_err(|err| RpcError::TokenUriDecode(format!("invalid utf-8: {err}")));
+                    .map_err(|err| RpcError::AbiStringDecode(format!("invalid utf-8: {err}")));
             }
         }
     }
@@ -469,18 +494,18 @@ fn decode_abi_string(value: &str) -> Result<String, RpcError> {
             .collect::<Vec<u8>>();
         if !trimmed.is_empty() {
             return String::from_utf8(trimmed)
-                .map_err(|err| RpcError::TokenUriDecode(format!("invalid bytes32 utf-8: {err}")));
+                .map_err(|err| RpcError::AbiStringDecode(format!("invalid bytes32 utf-8: {err}")));
         }
     }
 
-    Err(RpcError::TokenUriDecode(
-        "unsupported tokenURI return encoding".to_owned(),
+    Err(RpcError::AbiStringDecode(
+        "unsupported ABI string return encoding".to_owned(),
     ))
 }
 
 fn word_to_usize(word: &[u8]) -> Result<usize, RpcError> {
     if word.len() != 32 {
-        return Err(RpcError::TokenUriDecode(
+        return Err(RpcError::AbiStringDecode(
             "invalid ABI word length".to_owned(),
         ));
     }
@@ -490,7 +515,7 @@ fn word_to_usize(word: &[u8]) -> Result<usize, RpcError> {
         value = value
             .checked_mul(256)
             .and_then(|v| v.checked_add(*byte as usize))
-            .ok_or_else(|| RpcError::TokenUriDecode("ABI word overflows usize".to_owned()))?;
+            .ok_or_else(|| RpcError::AbiStringDecode("ABI word overflows usize".to_owned()))?;
     }
     Ok(value)
 }
