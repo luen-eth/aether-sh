@@ -177,45 +177,56 @@ impl IndexerService {
                     return;
                 };
 
-                let name = match rpc.contract_name(&token_address).await {
-                    Ok(value) => {
-                        let trimmed = value.trim();
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed.to_owned())
-                        }
-                    }
-                    Err(err) => {
-                        warn!(
-                            token_address = %token_address,
-                            standard = %standard,
-                            error = %err,
-                            "failed to fetch token name"
-                        );
-                        None
-                    }
-                };
+                let name_result = rpc.contract_name(&token_address).await;
+                let symbol_result = rpc.contract_symbol(&token_address).await;
 
-                let symbol = match rpc.contract_symbol(&token_address).await {
-                    Ok(value) => {
-                        let trimmed = value.trim();
-                        if trimmed.is_empty() {
-                            None
-                        } else {
-                            Some(trimmed.to_owned())
-                        }
+                let name = name_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| normalize_metadata_text(value));
+                let symbol = symbol_result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| normalize_metadata_text(value));
+
+                let mut failed_fields = Vec::new();
+                let mut expected_failures = Vec::new();
+                let mut unexpected_failures = Vec::new();
+
+                if let Err(err) = &name_result {
+                    failed_fields.push("name");
+                    if err.is_expected_metadata_call_failure() {
+                        expected_failures.push(format!("name: {err}"));
+                    } else {
+                        unexpected_failures.push(format!("name: {err}"));
                     }
-                    Err(err) => {
-                        warn!(
-                            token_address = %token_address,
-                            standard = %standard,
-                            error = %err,
-                            "failed to fetch token symbol"
-                        );
-                        None
+                }
+                if let Err(err) = &symbol_result {
+                    failed_fields.push("symbol");
+                    if err.is_expected_metadata_call_failure() {
+                        expected_failures.push(format!("symbol: {err}"));
+                    } else {
+                        unexpected_failures.push(format!("symbol: {err}"));
                     }
-                };
+                }
+
+                if !unexpected_failures.is_empty() {
+                    warn!(
+                        token_address = %token_address,
+                        standard = %standard,
+                        failed_fields = %failed_fields.join(","),
+                        errors = %unexpected_failures.join(" | "),
+                        "failed to fetch token metadata"
+                    );
+                } else if !expected_failures.is_empty() {
+                    debug!(
+                        token_address = %token_address,
+                        standard = %standard,
+                        failed_fields = %failed_fields.join(","),
+                        errors = %expected_failures.join(" | "),
+                        "token metadata method unavailable/reverted"
+                    );
+                }
 
                 if name.is_none() && symbol.is_none() {
                     return;
@@ -495,6 +506,15 @@ fn suggested_split_to(err: &RpcError, range_from: u64, range_to: u64) -> Option<
         Some(suggested_to)
     } else {
         None
+    }
+}
+
+fn normalize_metadata_text(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
     }
 }
 

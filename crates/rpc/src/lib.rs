@@ -190,6 +190,13 @@ impl RpcClient {
                                 error = %err,
                                 "rpc log result limit reached"
                             );
+                        } else if method == "eth_call" && err.is_expected_metadata_call_failure() {
+                            debug!(
+                                method,
+                                endpoint,
+                                error = %err,
+                                "rpc eth_call metadata method unavailable/reverted"
+                            );
                         } else {
                             warn!(
                                 method,
@@ -380,6 +387,13 @@ impl RpcError {
         }
     }
 
+    pub fn is_expected_metadata_call_failure(&self) -> bool {
+        let Some(message) = self.message_for_delay_hint() else {
+            return false;
+        };
+        is_expected_metadata_call_failure_message(message)
+    }
+
     fn message_for_delay_hint(&self) -> Option<&str> {
         match self {
             Self::RpcStatus(_, message)
@@ -403,6 +417,16 @@ fn is_log_result_limit_message(message: &str) -> bool {
         || normalized.contains("more than")
             && normalized.contains("results")
             && normalized.contains("eth_getlogs")
+}
+
+fn is_expected_metadata_call_failure_message(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase();
+    normalized.contains("invalidjump")
+        || normalized.contains("invalid opcode")
+        || normalized.contains("execution reverted")
+        || normalized.contains("function selector was not recognized")
+        || normalized.contains("no fallback function")
+        || normalized.contains("evm error")
 }
 
 fn parse_log_retry_range(message: &str) -> Option<(u64, u64)> {
